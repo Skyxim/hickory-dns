@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Benjamin Fry <benjaminfry@me.com>
+// Copyright 2015-2019 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
 // https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
@@ -6,141 +6,180 @@
 // copied, modified, or distributed except according to those terms.
 
 //! Structs for creating and using a Resolver
-use std::io;
-use std::net::IpAddr;
-use std::sync::Mutex;
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
+use std::task::{Context, Poll};
 
-use proto::rr::domain::TryParseIp;
-use proto::rr::IntoName;
-use proto::rr::RecordType;
-use tokio::runtime::{self, Runtime};
+use futures_util::{
+    FutureExt,
+    future::{self, BoxFuture},
+    lock::Mutex as AsyncMutex,
+};
+use tracing::debug;
 
-use crate::config::{ResolverConfig, ResolverOpts};
-use crate::error::*;
-use crate::lookup;
-use crate::lookup::Lookup;
-use crate::lookup_ip::LookupIp;
-use crate::name_server::TokioConnectionProvider;
-use crate::AsyncResolver;
-
-/// The Resolver is used for performing DNS queries.
-///
-/// For forward (A) lookups, hostname -> IP address, see: `Resolver::lookup_ip`
-///
-/// Special note about resource consumption. The Resolver and all Hickory DNS software is built around the Tokio async-io library. This synchronous Resolver is intended to be a simpler wrapper for of the [`AsyncResolver`]. To allow the `Resolver` to be [`Send`] + [`Sync`], the construction of the `AsyncResolver` is lazy, this means some of the features of the `AsyncResolver`, like performance based resolution via the most efficient `NameServer` will be lost (the lookup cache is shared across invocations of the `Resolver`). If these other features of the Hickory DNS Resolver are desired, please use the tokio based [`AsyncResolver`].
-///
-/// *Note: Threaded/Sync usage*: In multithreaded scenarios, the internal Tokio Runtime will block on an internal Mutex for the tokio Runtime in use. For higher performance, it's recommended to use the [`AsyncResolver`].
-pub struct Resolver {
-    // TODO: Mutex allows this to be Sync, another option would be to instantiate a thread_local, but that has other
-    //   drawbacks. One major issues, is if this Resolver is shared across threads, it will cause all to block on any
-    //   query. A TLS on the other hand would not, at the cost of only allowing a Resolver to be configured once per Thread
-    runtime: Mutex<Runtime>,
-    async_resolver: AsyncResolver<TokioConnectionProvider>,
-}
+#[cfg(feature = "__tls")]
+use crate::connection_provider::TlsConfig;
+#[cfg(feature = "tokio")]
+use crate::net::runtime::TokioRuntimeProvider;
+use crate::{
+    cache::{MAX_TTL, ResponseCache, TtlConfig},
+    caching_client::CachingClient,
+    config::{OpportunisticEncryption, ResolveHosts, ResolverConfig, ResolverOpts},
+    connection_provider::ConnectionProvider,
+    hosts::Hosts,
+    lookup::Lookup,
+    lookup_ip::{LookupIp, LookupIpFuture},
+    name_server_pool::{NameServerPool, NameServerTransportState, PoolContext},
+    net::{
+        NetError,
+        xfer::{DnsHandle, RetryDnsHandle},
+    },
+    proto::{
+        op::{DnsRequest, DnsRequestOptions, DnsResponse, Query},
+        rr::domain::is_onion,
+        rr::{IntoName, Name, RData, Record, RecordType},
+    },
+};
+#[cfg(feature = "__dnssec")]
+use crate::{net::dnssec::DnssecDnsHandle, proto::dnssec::TrustAnchors};
 
 macro_rules! lookup_fn {
-    ($p:ident, $l:ty) => {
+    ($p:ident, $r:path) => {
         /// Performs a lookup for the associated type.
         ///
         /// *hint* queries that end with a '.' are fully qualified names and are cheaper lookups
         ///
         /// # Arguments
         ///
-        /// * `query` - a `&str` which parses to a domain name, failure to parse will return an error
-        pub fn $p<N: IntoName>(&self, query: N) -> ResolveResult<$l> {
-            let lookup = self.async_resolver.$p(query);
-            self.runtime.lock()?.block_on(lookup)
-        }
-    };
-    ($p:ident, $l:ty, $t:ty) => {
-        /// Performs a lookup for the associated type.
-        ///
-        /// # Arguments
-        ///
-        /// * `query` - a type which can be converted to `Name` via `From`.
-        pub fn $p(&self, query: $t) -> ResolveResult<$l> {
-            let lookup = self.async_resolver.$p(query);
-            self.runtime.lock()?.block_on(lookup)
+        /// * `query` - a string which parses to a domain name, failure to parse will return an error
+        pub async fn $p(&self, query: impl IntoName) -> Result<Lookup, NetError> {
+            self.inner_lookup(query.into_name()?, $r, self.request_options())
+                .await
         }
     };
 }
 
-impl Resolver {
-    /// Constructs a new Resolver with the specified configuration.
-    ///
-    /// # Arguments
-    /// * `config` - configuration for the resolver
-    /// * `options` - resolver options for performing lookups
-    ///
-    /// # Returns
-    ///
-    /// A new `Resolver` or an error if there was an error with the configuration.
-    pub fn new(config: ResolverConfig, options: ResolverOpts) -> io::Result<Self> {
-        let mut builder = runtime::Builder::new_current_thread();
-        builder.enable_all();
+/// A Resolver used with Tokio
+#[cfg(feature = "tokio")]
+pub type TokioResolver = Resolver<TokioRuntimeProvider>;
 
-        let runtime = builder.build()?;
-        let async_resolver =
-            AsyncResolver::new(config, options, TokioConnectionProvider::default());
-
-        Ok(Self {
-            runtime: Mutex::new(runtime),
-            async_resolver,
-        })
-    }
-
-    /// Constructs a new Resolver with default config and default options.
-    ///
-    /// See [`ResolverConfig::default`] and [`ResolverOpts::default`] for more information.
-    ///
-    /// # Returns
-    ///
-    /// A new `Resolver` or an error if there was an error with the configuration.
-    #[allow(clippy::should_implement_trait)]
-    pub fn default() -> io::Result<Self> {
-        Self::new(ResolverConfig::default(), ResolverOpts::default())
-    }
-
-    /// Constructs a new Resolver with the system configuration.
+#[cfg(feature = "tokio")]
+impl TokioResolver {
+    /// Constructs a new Tokio based Resolver with the system configuration.
     ///
     /// This will use `/etc/resolv.conf` on Unix OSes and the registry on Windows.
     #[cfg(any(unix, target_os = "windows"))]
     #[cfg(feature = "system-config")]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(all(feature = "system-config", any(unix, target_os = "windows"))))
-    )]
-    pub fn from_system_conf() -> io::Result<Self> {
+    pub fn builder_tokio() -> Result<ResolverBuilder<TokioRuntimeProvider>, NetError> {
+        Self::builder(TokioRuntimeProvider::default())
+    }
+}
+
+/// An asynchronous resolver for DNS generic over async Runtimes.
+///
+/// The lookup methods on `Resolver` spawn background tasks to perform
+/// queries. The futures returned by a `Resolver` and the corresponding
+/// background tasks need not be spawned on the same executor, or be in the
+/// same thread.
+///
+/// *NOTE* If lookup futures returned by a `Resolver` and the background
+/// tasks are spawned on two separate `CurrentThread` executors, one thread
+/// cannot run both executors simultaneously, so the `run` or `block_on`
+/// functions will cause the thread to deadlock. If both the background work
+/// and the lookup futures are intended to be run on the same thread, they
+/// should be spawned on the same executor.
+#[derive(Clone)]
+pub struct Resolver<P: ConnectionProvider> {
+    domain: Option<Name>,
+    search: Vec<Name>,
+    context: Arc<PoolContext>,
+    client_cache: CachingClient<LookupEither<P>>,
+    hosts: Arc<Hosts>,
+}
+
+impl<R: ConnectionProvider> Resolver<R> {
+    /// Constructs a new [`Resolver`] via [`ResolverBuilder`] with the operating system's
+    /// configuration.
+    ///
+    /// To use this with Tokio, see [TokioResolver::builder_tokio] instead.
+    ///
+    /// This will use `/etc/resolv.conf` on Unix OSes and the registry on Windows.
+    #[cfg(any(unix, target_os = "windows"))]
+    #[cfg(feature = "system-config")]
+    pub fn builder(provider: R) -> Result<ResolverBuilder<R>, NetError> {
         let (config, options) = super::system_conf::read_system_conf()?;
-        Self::new(config, options)
+        let mut builder = Self::builder_with_config(config, provider);
+        *builder.options_mut() = options;
+        Ok(builder)
     }
 
-    /// Flushes/Removes all entries from the cache
-    pub fn clear_cache(&self) {
-        self.async_resolver.clear_cache();
+    /// Construct a new [`Resolver`] via [`ResolverBuilder`] with the provided configuration.
+    pub fn builder_with_config(config: ResolverConfig, provider: R) -> ResolverBuilder<R> {
+        ResolverBuilder {
+            config,
+            options: ResolverOpts::default(),
+            provider,
+            #[cfg(feature = "__tls")]
+            tls: None,
+            opportunistic_encryption: OpportunisticEncryption::default(),
+            encrypted_transport_state: NameServerTransportState::default(),
+            #[cfg(feature = "__dnssec")]
+            trust_anchor: None,
+            #[cfg(feature = "__dnssec")]
+            nsec3_soft_iteration_limit: None,
+            #[cfg(feature = "__dnssec")]
+            nsec3_hard_iteration_limit: None,
+        }
     }
 
-    /// Read the config for this resolver.
-    pub fn config(&self) -> &ResolverConfig {
-        self.async_resolver.config()
-    }
-
-    /// Read the options for this resolver.
-    pub fn options(&self) -> &ResolverOpts {
-        self.async_resolver.options()
+    /// Customizes the static hosts used in this resolver.
+    pub fn set_hosts(&mut self, hosts: Arc<Hosts>) {
+        self.hosts = hosts;
     }
 
     /// Generic lookup for any RecordType
     ///
-    /// *WARNING* This interface may change in the future, please use [`Self::lookup_ip`] or another variant for more stable interfaces.
+    /// *WARNING* this interface may change in the future, see if one of the specializations would be better.
     ///
     /// # Arguments
     ///
     /// * `name` - name of the record to lookup, if name is not a valid domain name, an error will be returned
-    /// * `record_type` - type of record to lookup
-    pub fn lookup<N: IntoName>(&self, name: N, record_type: RecordType) -> ResolveResult<Lookup> {
-        let lookup = self.async_resolver.lookup(name, record_type);
-        self.runtime.lock()?.block_on(lookup)
+    /// * `record_type` - type of record to lookup, all RecordData responses will be filtered to this type
+    ///
+    /// # Returns
+    ///
+    //  A future for the returned Lookup RData
+    pub async fn lookup(
+        &self,
+        name: impl IntoName,
+        record_type: RecordType,
+    ) -> Result<Lookup, NetError> {
+        self.inner_lookup(name.into_name()?, record_type, self.request_options())
+            .await
+    }
+
+    pub(crate) async fn inner_lookup<L>(
+        &self,
+        name: Name,
+        record_type: RecordType,
+        options: DnsRequestOptions,
+    ) -> Result<L, NetError>
+    where
+        L: From<Lookup> + Send + Sync + 'static,
+    {
+        let names = self.build_names(name);
+        LookupFuture::lookup_with_hosts(
+            names,
+            record_type,
+            options,
+            self.client_cache.clone(),
+            self.hosts.clone(),
+        )
+        .await
+        .map(L::from)
     }
 
     /// Performs a dual-stack DNS lookup for the IP for the given hostname.
@@ -148,83 +187,1424 @@ impl Resolver {
     /// See the configuration and options parameters for controlling the way in which A(Ipv4) and AAAA(Ipv6) lookups will be performed. For the least expensive query a fully-qualified-domain-name, FQDN, which ends in a final `.`, e.g. `www.example.com.`, will only issue one query. Anything else will always incur the cost of querying the `ResolverConfig::domain` and `ResolverConfig::search`.
     ///
     /// # Arguments
-    ///
     /// * `host` - string hostname, if this is an invalid hostname, an error will be returned.
-    pub fn lookup_ip<N: IntoName + TryParseIp>(&self, host: N) -> ResolveResult<LookupIp> {
-        let lookup = self.async_resolver.lookup_ip(host);
-        self.runtime.lock()?.block_on(lookup)
+    pub async fn lookup_ip(&self, host: impl IntoName) -> Result<LookupIp, NetError> {
+        let mut finally_ip_addr = None;
+        let maybe_ip = host.to_ip().map(RData::from);
+        let maybe_name = host.into_name().map_err(NetError::from);
+
+        // if host is a ip address, return directly.
+        if let Some(ip_addr) = maybe_ip {
+            let name = maybe_name.clone().unwrap_or_default();
+            let record = Record::from_rdata(name.clone(), MAX_TTL, ip_addr.clone());
+
+            // if ndots are greater than 4, then we can't assume the name is an IpAddr
+            //   this accepts IPv6 as well, b/c IPv6 can take the form: 2001:db8::198.51.100.35
+            //   but `:` is not a valid DNS character, so technically this will fail parsing.
+            //   TODO: should we always do search before returning this?
+            if self.context.options.ndots > 4 {
+                finally_ip_addr = Some(record);
+            } else {
+                let query = Query::new(name, ip_addr.record_type());
+                let lookup = Lookup::new_with_max_ttl(query, [record]);
+                return Ok(lookup.into());
+            }
+        }
+
+        let name = match (maybe_name, finally_ip_addr.as_ref()) {
+            (Ok(name), _) => name,
+            (Err(_), Some(ip_addr)) => {
+                // it was a valid IP, return that...
+                let query = Query::new(ip_addr.name.clone(), ip_addr.record_type());
+                let lookup = Lookup::new_with_max_ttl(query, [ip_addr.clone()]);
+                return Ok(lookup.into());
+            }
+            (Err(err), None) => return Err(err),
+        };
+
+        let names = self.build_names(name);
+        let hosts = self.hosts.clone();
+
+        LookupIpFuture::lookup(
+            names,
+            self.context.options.ip_strategy,
+            self.client_cache.clone(),
+            self.request_options(),
+            hosts,
+            finally_ip_addr.map(|r| r.data),
+        )
+        .await
     }
 
-    lookup_fn!(reverse_lookup, lookup::ReverseLookup, IpAddr);
-    lookup_fn!(ipv4_lookup, lookup::Ipv4Lookup);
-    lookup_fn!(ipv6_lookup, lookup::Ipv6Lookup);
-    lookup_fn!(mx_lookup, lookup::MxLookup);
-    lookup_fn!(ns_lookup, lookup::NsLookup);
-    lookup_fn!(soa_lookup, lookup::SoaLookup);
-    lookup_fn!(srv_lookup, lookup::SrvLookup);
-    lookup_fn!(tlsa_lookup, lookup::TlsaLookup);
-    lookup_fn!(txt_lookup, lookup::TxtLookup);
+    /// Clear the cache for a specific lookup
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - name of the record to clear
+    /// * `record_type` - type of record to clear
+    ///
+    pub fn clear_lookup_cache(&self, name: impl IntoName, record_type: RecordType) {
+        let Ok(name) = name.into_name() else {
+            return;
+        };
+
+        for name in self.build_names(name) {
+            let query = Query::new(name, record_type);
+            self.client_cache.clear_cache_query(&query);
+        }
+    }
+
+    fn build_names(&self, name: Name) -> Vec<Name> {
+        // if it's fully qualified, we can short circuit the lookup logic
+        if name.is_fqdn()
+            || is_onion(&name)
+                && name
+                    .trim_to(2)
+                    .iter()
+                    .next()
+                    .map(|name| name.len() == 56) // size of onion v3 address
+                    .unwrap_or(false)
+        {
+            // if already fully qualified, or if onion address, don't assume it might be a
+            // sub-domain
+            vec![name]
+        } else {
+            // Otherwise we have to build the search list
+            // Note: the vec is built in reverse order of precedence, for stack semantics
+            let mut names =
+                Vec::<Name>::with_capacity(1 /*FQDN*/ + 1 /*DOMAIN*/ + self.search.len());
+
+            // if not meeting ndots, we always do the raw name in the final lookup, or it's a localhost...
+            let raw_name_first: bool =
+                name.num_labels() as usize > self.context.options.ndots || name.is_localhost();
+
+            // if not meeting ndots, we always do the raw name in the final lookup
+            if !raw_name_first {
+                let mut fqdn = name.clone();
+                fqdn.set_fqdn(true);
+                names.push(fqdn);
+            }
+
+            for search in self.search.iter().rev() {
+                let name_search = name.clone().append_domain(search);
+
+                match name_search {
+                    Ok(name_search) => {
+                        if !names.contains(&name_search) {
+                            names.push(name_search);
+                        }
+                    }
+                    Err(e) => debug!(
+                        "Not adding {} to {} for search due to error: {}",
+                        search, name, e
+                    ),
+                }
+            }
+
+            if let Some(domain) = &self.domain {
+                let name_search = name.clone().append_domain(domain);
+
+                match name_search {
+                    Ok(name_search) => {
+                        if !names.contains(&name_search) {
+                            names.push(name_search);
+                        }
+                    }
+                    Err(e) => debug!(
+                        "Not adding {} to {} for search due to error: {}",
+                        domain, name, e
+                    ),
+                }
+            }
+
+            // this is the direct name lookup
+            if raw_name_first {
+                // adding the name as though it's an FQDN for lookup
+                let mut fqdn = name.clone();
+                fqdn.set_fqdn(true);
+                names.push(fqdn);
+            }
+
+            names
+        }
+    }
+
+    lookup_fn!(reverse_lookup, RecordType::PTR);
+    lookup_fn!(ipv4_lookup, RecordType::A);
+    lookup_fn!(ipv6_lookup, RecordType::AAAA);
+    lookup_fn!(mx_lookup, RecordType::MX);
+    lookup_fn!(ns_lookup, RecordType::NS);
+    lookup_fn!(smimea_lookup, RecordType::SMIMEA);
+    lookup_fn!(soa_lookup, RecordType::SOA);
+    lookup_fn!(srv_lookup, RecordType::SRV);
+    lookup_fn!(tlsa_lookup, RecordType::TLSA);
+    lookup_fn!(txt_lookup, RecordType::TXT);
+    lookup_fn!(cert_lookup, RecordType::CERT);
+
+    /// Flushes/Removes all entries from the cache
+    pub fn clear_cache(&self) {
+        self.client_cache.clear_cache();
+    }
+
+    /// Per request options based on the ResolverOpts
+    pub(crate) fn request_options(&self) -> DnsRequestOptions {
+        let mut request_opts = DnsRequestOptions::default();
+        request_opts.recursion_desired = self.context.options.recursion_desired;
+        request_opts.use_edns = self.context.options.edns0;
+        request_opts.edns_payload_len = self.context.options.edns_payload_len;
+        request_opts.case_randomization = self.context.options.case_randomization;
+
+        // Set DNSSEC OK bit when DNSSEC validation is enabled
+        #[cfg(feature = "__dnssec")]
+        {
+            request_opts.edns_set_dnssec_ok = self.context.options.validate;
+        }
+
+        request_opts
+    }
+
+    /// Read the options for this resolver.
+    pub fn options(&self) -> &ResolverOpts {
+        &self.context.options
+    }
+}
+
+impl<P: ConnectionProvider> fmt::Debug for Resolver<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Resolver").finish()
+    }
+}
+
+/// Different lookup options for the lookup attempts and validation
+#[derive(Clone)]
+enum LookupEither<P: ConnectionProvider> {
+    Retry(RetryDnsHandle<NameServerPool<P>>),
+    #[cfg(feature = "__dnssec")]
+    Secure(DnssecDnsHandle<RetryDnsHandle<NameServerPool<P>>>),
+}
+
+impl<P: ConnectionProvider> DnsHandle for LookupEither<P> {
+    type Runtime = P::RuntimeProvider;
+
+    fn is_verifying_dnssec(&self) -> bool {
+        match self {
+            Self::Retry(c) => c.is_verifying_dnssec(),
+            #[cfg(feature = "__dnssec")]
+            Self::Secure(c) => c.is_verifying_dnssec(),
+        }
+    }
+
+    async fn send(&self, request: DnsRequest) -> Result<DnsResponse, NetError> {
+        match self {
+            Self::Retry(c) => c.send(request).await,
+            #[cfg(feature = "__dnssec")]
+            Self::Secure(c) => c.send(request).await,
+        }
+    }
+}
+
+/// A builder to construct a [`Resolver`].
+///
+/// Created by [`Resolver::builder`].
+pub struct ResolverBuilder<P> {
+    config: ResolverConfig,
+    options: ResolverOpts,
+    provider: P,
+
+    #[cfg(feature = "__tls")]
+    tls: Option<rustls::ClientConfig>,
+    opportunistic_encryption: OpportunisticEncryption,
+    encrypted_transport_state: NameServerTransportState,
+    #[cfg(feature = "__dnssec")]
+    trust_anchor: Option<Arc<TrustAnchors>>,
+    #[cfg(feature = "__dnssec")]
+    nsec3_soft_iteration_limit: Option<u16>,
+    #[cfg(feature = "__dnssec")]
+    nsec3_hard_iteration_limit: Option<u16>,
+}
+
+impl<P: ConnectionProvider> ResolverBuilder<P> {
+    /// Sets the [`ResolverOpts`] to be used by the resolver.
+    ///
+    /// NB: A [`ResolverBuilder<P>`] will use the system configuration e.g., `resolv.conf`, by
+    /// default. Usage of this method will overwrite any options set by the system configuration.
+    ///
+    /// See [`system_conf`][crate::system_conf] for functions that can parse a [`ResolverOpts`]
+    /// from the system configuration, or use [`options_mut()`][ResolverBuilder::with_options] to
+    /// acquire a muitable reference to the existing [`ResolverOpts`].
+    pub fn with_options(mut self, options: ResolverOpts) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Returns a mutable reference to the [`ResolverOpts`].
+    pub fn options_mut(&mut self) -> &mut ResolverOpts {
+        &mut self.options
+    }
+
+    /// Set the DNSSEC trust anchors to be used by the resolver.
+    #[cfg(feature = "__dnssec")]
+    pub fn with_trust_anchor(mut self, trust_anchor: Arc<TrustAnchors>) -> Self {
+        self.trust_anchor = Some(trust_anchor);
+        self
+    }
+
+    /// Set the TLS configuration to be used by the resolver.
+    #[cfg(feature = "__tls")]
+    pub fn with_tls_config(mut self, config: rustls::ClientConfig) -> Self {
+        self.tls = Some(config);
+        self
+    }
+
+    /// Set the opportunistic encryption configuration to be used by the resolver.
+    pub fn with_opportunistic_encryption(
+        mut self,
+        opportunistic_encryption: OpportunisticEncryption,
+    ) -> Self {
+        self.opportunistic_encryption = opportunistic_encryption;
+        self
+    }
+
+    /// Set pre-existing encrypted transport state for use with opportunistic encryption.
+    pub fn with_encrypted_transport_state(
+        mut self,
+        encrypted_transport_state: NameServerTransportState,
+    ) -> Self {
+        self.encrypted_transport_state = encrypted_transport_state;
+        self
+    }
+
+    /// Set maximum limits on NSEC3 additional iterations.
+    ///
+    /// See [RFC 9276](https://www.rfc-editor.org/rfc/rfc9276.html). Signed
+    /// zones that exceed the soft limit will be treated as insecure, and signed
+    /// zones that exceed the hard limit will be treated as bogus.
+    #[cfg(feature = "__dnssec")]
+    pub fn nsec3_iteration_limits(
+        mut self,
+        soft_limit: Option<u16>,
+        hard_limit: Option<u16>,
+    ) -> Self {
+        self.nsec3_soft_iteration_limit = soft_limit;
+        self.nsec3_hard_iteration_limit = hard_limit;
+        self
+    }
+
+    /// Construct the resolver.
+    pub fn build(self) -> Result<Resolver<P>, NetError> {
+        #[cfg_attr(not(feature = "__dnssec"), allow(unused_mut))]
+        let Self {
+            config:
+                ResolverConfig {
+                    domain,
+                    search,
+                    name_servers,
+                },
+            mut options,
+            provider,
+            #[cfg(feature = "__tls")]
+            tls,
+            #[cfg(feature = "__dnssec")]
+            trust_anchor,
+            #[cfg(feature = "__dnssec")]
+            nsec3_soft_iteration_limit,
+            #[cfg(feature = "__dnssec")]
+            nsec3_hard_iteration_limit,
+            opportunistic_encryption,
+            encrypted_transport_state,
+        } = self;
+
+        #[cfg(feature = "__dnssec")]
+        if trust_anchor.is_some() || options.trust_anchor.is_some() {
+            options.validate = true;
+        }
+
+        let context = Arc::new(PoolContext {
+            answer_address_filter: options.answer_address_filter(),
+            options,
+            #[cfg(feature = "__tls")]
+            tls: match tls {
+                Some(config) => config,
+                None => TlsConfig::new()?.config,
+            },
+            opportunistic_probe_budget: AtomicU8::new(
+                opportunistic_encryption
+                    .max_concurrent_probes()
+                    .unwrap_or_default(),
+            ),
+            opportunistic_encryption,
+            transport_state: AsyncMutex::new(encrypted_transport_state),
+        });
+
+        let pool = NameServerPool::from_config(name_servers, context.clone(), provider);
+
+        let client = RetryDnsHandle::new(pool, context.options.attempts);
+
+        #[cfg(feature = "__dnssec")]
+        let either = if context.options.validate {
+            let trust_anchor = trust_anchor.unwrap_or_else(|| Arc::new(TrustAnchors::default()));
+
+            LookupEither::Secure(
+                DnssecDnsHandle::with_trust_anchor(client, trust_anchor)
+                    .nsec3_iteration_limits(nsec3_soft_iteration_limit, nsec3_hard_iteration_limit),
+            )
+        } else {
+            LookupEither::Retry(client)
+        };
+        #[cfg(not(feature = "__dnssec"))]
+        let either = LookupEither::Retry(client);
+
+        let cache = ResponseCache::new(
+            context.options.cache_size,
+            TtlConfig::from_opts(&context.options),
+        );
+        let client_cache =
+            CachingClient::with_cache(cache, either, context.options.preserve_intermediates);
+
+        let hosts = Arc::new(match context.options.use_hosts_file {
+            ResolveHosts::Always | ResolveHosts::Auto => Hosts::from_system().unwrap_or_default(),
+            ResolveHosts::Never => Hosts::default(),
+        });
+
+        Ok(Resolver {
+            domain,
+            search,
+            context,
+            client_cache,
+            hosts,
+        })
+    }
+}
+
+/// The Future returned from [`Resolver`] when performing a lookup.
+#[doc(hidden)]
+pub struct LookupFuture<C>
+where
+    C: DnsHandle + 'static,
+{
+    client_cache: CachingClient<C>,
+    names: Vec<Name>,
+    record_type: RecordType,
+    options: DnsRequestOptions,
+    query: BoxFuture<'static, Result<Lookup, NetError>>,
+}
+
+impl<C> LookupFuture<C>
+where
+    C: DnsHandle + 'static,
+{
+    /// Perform a lookup from a name and type to a set of RDatas
+    ///
+    /// # Arguments
+    ///
+    /// * `names` - a set of DNS names to attempt to resolve, they will be attempted in queue order, i.e. the first is `names.pop()`. Upon each failure, the next will be attempted.
+    /// * `record_type` - type of record being sought
+    /// * `client_cache` - cache with a connection to use for performing all lookups
+    #[doc(hidden)]
+    pub fn lookup(
+        names: Vec<Name>,
+        record_type: RecordType,
+        options: DnsRequestOptions,
+        client_cache: CachingClient<C>,
+    ) -> Self {
+        Self::lookup_with_hosts(
+            names,
+            record_type,
+            options,
+            client_cache,
+            Arc::new(Hosts::default()),
+        )
+    }
+
+    /// Perform a lookup from a name and type to a set of RDatas, taking the local
+    /// hosts file into account.
+    ///
+    /// # Arguments
+    ///
+    /// * `names` - a set of DNS names to attempt to resolve, they will be attempted in queue order, i.e. the first is `names.pop()`. Upon each failure, the next will be attempted.
+    /// * `record_type` - type of record being sought
+    /// * `client_cache` - cache with a connection to use for performing all lookups
+    /// * `hosts` - the local host file, the records inside it will be prioritized over the upstream DNS server
+    #[doc(hidden)]
+    pub fn lookup_with_hosts(
+        mut names: Vec<Name>,
+        record_type: RecordType,
+        options: DnsRequestOptions,
+        client_cache: CachingClient<C>,
+        hosts: Arc<Hosts>,
+    ) -> Self {
+        let name = names
+            .pop()
+            .ok_or_else(|| NetError::from("can not lookup for no names"));
+
+        let query = match name {
+            Ok(name) => {
+                let query = Query::new(name, record_type);
+
+                if let Some(lookup) = hosts.lookup_static_host(&query) {
+                    future::ok(lookup).boxed()
+                } else {
+                    client_cache.lookup(query, options).boxed()
+                }
+            }
+            Err(err) => future::err(err).boxed(),
+        };
+
+        Self {
+            client_cache,
+            names,
+            record_type,
+            options,
+            query,
+        }
+    }
+}
+
+impl<C> Future for LookupFuture<C>
+where
+    C: DnsHandle + 'static,
+{
+    type Output = Result<Lookup, NetError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            // Try polling the underlying DNS query.
+            let query = self.query.as_mut().poll_unpin(cx);
+
+            // Determine whether or not we will attempt to retry the query.
+            let should_retry = match &query {
+                // If the query is NotReady, yield immediately.
+                Poll::Pending => return Poll::Pending,
+                // If the query returned a successful lookup, we will attempt
+                // to retry if the lookup is empty. Otherwise, we will return
+                // that lookup.
+                Poll::Ready(Ok(lookup)) => lookup.answers().is_empty(),
+                // If the query failed, we will attempt to retry.
+                Poll::Ready(Err(_)) => true,
+            };
+
+            if should_retry {
+                if let Some(name) = self.names.pop() {
+                    let record_type = self.record_type;
+                    let options = self.options;
+
+                    // If there's another name left to try, build a new query
+                    // for that next name and continue looping.
+                    self.query = self
+                        .client_cache
+                        .lookup(Query::new(name, record_type), options)
+                        .boxed();
+                    // Continue looping with the new query. It will be polled
+                    // on the next iteration of the loop.
+                    continue;
+                }
+            }
+            // If we didn't have to retry the query, or we weren't able to
+            // retry because we've exhausted the names to search, return the
+            // current query.
+            return query;
+            // If we skipped retrying the  query, this will return the
+            // successful lookup, otherwise, if the retry failed, this will
+            // return the last  query result --- either an empty lookup or the
+            // last error we saw.
+        }
+    }
+}
+
+/// Unit tests compatible with different runtime.
+#[cfg(all(test, feature = "tokio"))]
+pub(crate) mod testing {
+    use std::{net::*, str::FromStr};
+
+    use tokio::runtime::Runtime;
+
+    use crate::config::{GOOGLE, LookupIpStrategy, NameServerConfig, ResolverConfig};
+    use crate::connection_provider::ConnectionProvider;
+    use crate::net::runtime::TokioRuntimeProvider;
+    use crate::proto::rr::Name;
+    use crate::resolver::Resolver;
+
+    /// Test IP lookup from URLs.
+    pub(crate) async fn lookup_test<R: ConnectionProvider>(config: ResolverConfig, handle: R) {
+        let resolver = Resolver::<R>::builder_with_config(config, handle)
+            .build()
+            .unwrap();
+
+        let response = resolver
+            .lookup_ip("www.example.com.")
+            .await
+            .expect("failed to run lookup");
+
+        assert_ne!(response.iter().count(), 0);
+    }
+
+    /// Test IP lookup from IP literals.
+    pub(crate) async fn ip_lookup_test<R: ConnectionProvider>(handle: R) {
+        let resolver =
+            Resolver::<R>::builder_with_config(ResolverConfig::udp_and_tcp(&GOOGLE), handle)
+                .build()
+                .unwrap();
+
+        let response = resolver
+            .lookup_ip("10.1.0.2")
+            .await
+            .expect("failed to run lookup");
+
+        assert_eq!(
+            Some(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 2))),
+            response.iter().next()
+        );
+
+        let response = resolver
+            .lookup_ip("2606:2800:21f:cb07:6820:80da:af6b:8b2c")
+            .await
+            .expect("failed to run lookup");
+
+        assert_eq!(
+            Some(IpAddr::V6(Ipv6Addr::new(
+                0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c,
+            ))),
+            response.iter().next()
+        );
+    }
+
+    /// Test IP lookup from IP literals across threads.
+    pub(crate) fn ip_lookup_across_threads_test(handle: TokioRuntimeProvider) {
+        // Test ensuring that running the background task on a separate
+        // executor in a separate thread from the futures returned by the
+        // Resolver works correctly.
+        use std::thread;
+        let resolver = Resolver::builder_with_config(ResolverConfig::udp_and_tcp(&GOOGLE), handle)
+            .build()
+            .unwrap();
+
+        let resolver_one = resolver.clone();
+        let resolver_two = resolver;
+
+        let test_fn = |resolver: Resolver<TokioRuntimeProvider>| {
+            let exec = Runtime::new().unwrap();
+
+            let response = exec
+                .block_on(resolver.lookup_ip("10.1.0.2"))
+                .expect("failed to run lookup");
+
+            assert_eq!(
+                Some(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 2))),
+                response.iter().next()
+            );
+
+            let response = exec
+                .block_on(resolver.lookup_ip("2606:2800:21f:cb07:6820:80da:af6b:8b2c"))
+                .expect("failed to run lookup");
+
+            assert_eq!(
+                Some(IpAddr::V6(Ipv6Addr::new(
+                    0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c,
+                ))),
+                response.iter().next()
+            );
+        };
+
+        let thread_one = thread::spawn(move || {
+            test_fn(resolver_one);
+        });
+
+        let thread_two = thread::spawn(move || {
+            test_fn(resolver_two);
+        });
+
+        thread_one.join().expect("thread_one failed");
+        thread_two.join().expect("thread_two failed");
+    }
+
+    /// Test IP lookup from URLs with DNSSEC validation.
+    #[cfg(feature = "__dnssec")]
+    #[allow(clippy::print_stdout)]
+    pub(crate) async fn sec_lookup_test<R: ConnectionProvider>(handle: R) {
+        let mut resolver_builder =
+            Resolver::builder_with_config(ResolverConfig::udp_and_tcp(&GOOGLE), handle);
+        resolver_builder.options_mut().validate = true;
+        resolver_builder.options_mut().try_tcp_on_error = true;
+        let resolver = resolver_builder.build().unwrap();
+
+        let response = resolver
+            .lookup_ip("cloudflare.com.")
+            .await
+            .expect("failed to run lookup");
+
+        assert_ne!(response.iter().count(), 0);
+        println!(
+            "{:?}",
+            response
+                .as_lookup()
+                .message()
+                .all_sections()
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            response
+                .as_lookup()
+                .message()
+                .all_sections()
+                .any(|record| record.proof.is_secure())
+        );
+    }
+
+    /// Test IP lookup from domains that exist but unsigned with DNSSEC validation.
+    #[cfg(feature = "__dnssec")]
+    #[allow(clippy::print_stdout)]
+    pub(crate) async fn sec_lookup_fails_test<R: ConnectionProvider>(handle: R) {
+        let mut resolver_builder =
+            Resolver::builder_with_config(ResolverConfig::udp_and_tcp(&GOOGLE), handle);
+        resolver_builder.options_mut().validate = true;
+        resolver_builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only;
+        let resolver = resolver_builder.build().unwrap();
+
+        // needs to be a domain that exists, but is not signed (eventually this will be)
+        let response = resolver.lookup_ip("hickory-dns.org.").await;
+
+        let lookup_ip = response.unwrap();
+        println!(
+            "{:?}",
+            lookup_ip
+                .as_lookup()
+                .message()
+                .all_sections()
+                .collect::<Vec<_>>()
+        );
+        for record in lookup_ip.as_lookup().message().all_sections() {
+            assert!(record.proof.is_insecure());
+        }
+    }
+
+    /// Test Resolver created from system configuration with IP lookup.
+    #[cfg(feature = "system-config")]
+    pub(crate) async fn system_lookup_test<R: ConnectionProvider>(handle: R) {
+        let resolver = Resolver::<R>::builder(handle)
+            .expect("failed to create resolver")
+            .build()
+            .unwrap();
+
+        let response = resolver
+            .lookup_ip("www.example.com.")
+            .await
+            .expect("failed to run lookup");
+
+        assert_eq!(response.iter().count(), 2);
+        for address in response.iter() {
+            if address.is_ipv4() {
+                assert_eq!(address, IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)));
+            } else {
+                assert_eq!(
+                    address,
+                    IpAddr::V6(Ipv6Addr::new(
+                        0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c,
+                    ))
+                );
+            }
+        }
+    }
+
+    /// Test Resolver created from system configuration with host lookups.
+    #[cfg(all(unix, feature = "system-config"))]
+    pub(crate) async fn hosts_lookup_test<R: ConnectionProvider>(handle: R) {
+        let resolver = Resolver::<R>::builder(handle)
+            .expect("failed to create resolver")
+            .build()
+            .unwrap();
+
+        let response = resolver
+            .lookup_ip("a.com")
+            .await
+            .expect("failed to run lookup");
+
+        assert_eq!(response.iter().count(), 1);
+        for address in response.iter() {
+            if address.is_ipv4() {
+                assert_eq!(address, IpAddr::V4(Ipv4Addr::new(10, 1, 0, 104)));
+            } else {
+                panic!("failed to run lookup");
+            }
+        }
+    }
+
+    /// Test fqdn.
+    pub(crate) async fn fqdn_test<R: ConnectionProvider>(handle: R) {
+        let domain = Name::from_str("incorrect.example.com.").unwrap();
+        let search = vec![
+            Name::from_str("bad.example.com.").unwrap(),
+            Name::from_str("wrong.example.com.").unwrap(),
+        ];
+        let name_servers: Vec<NameServerConfig> = ResolverConfig::udp_and_tcp(&GOOGLE)
+            .name_servers()
+            .to_owned();
+
+        let mut resolver_builder = Resolver::<R>::builder_with_config(
+            ResolverConfig::from_parts(Some(domain), search, name_servers),
+            handle,
+        );
+        resolver_builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only;
+        let resolver = resolver_builder.build().unwrap();
+
+        let response = resolver
+            .lookup_ip("www.example.com.")
+            .await
+            .expect("failed to run lookup");
+
+        assert_ne!(response.iter().count(), 0);
+        for address in response.iter() {
+            assert!(address.is_ipv4(), "should only be looking up IPv4");
+        }
+    }
+
+    /// Test ndots with non-fqdn.
+    pub(crate) async fn ndots_test<R: ConnectionProvider>(handle: R) {
+        let domain = Name::from_str("incorrect.example.com.").unwrap();
+        let search = vec![
+            Name::from_str("bad.example.com.").unwrap(),
+            Name::from_str("wrong.example.com.").unwrap(),
+        ];
+        let name_servers: Vec<NameServerConfig> = ResolverConfig::udp_and_tcp(&GOOGLE)
+            .name_servers()
+            .to_owned();
+
+        let mut resolver_builder = Resolver::<R>::builder_with_config(
+            ResolverConfig::from_parts(Some(domain), search, name_servers),
+            handle,
+        );
+        // our name does have 2, the default should be fine, let's just narrow the test criteria a bit.
+        resolver_builder.options_mut().ndots = 2;
+        resolver_builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only;
+        let resolver = resolver_builder.build().unwrap();
+
+        // notice this is not a FQDN, no trailing dot.
+        let response = resolver
+            .lookup_ip("www.example.com")
+            .await
+            .expect("failed to run lookup");
+
+        assert_ne!(response.iter().count(), 0);
+        for address in response.iter() {
+            assert!(address.is_ipv4(), "should only be looking up IPv4");
+        }
+    }
+
+    /// Test large ndots with non-fqdn.
+    pub(crate) async fn large_ndots_test<R: ConnectionProvider>(handle: R) {
+        let domain = Name::from_str("incorrect.example.com.").unwrap();
+        let search = vec![
+            Name::from_str("bad.example.com.").unwrap(),
+            Name::from_str("wrong.example.com.").unwrap(),
+        ];
+        let name_servers: Vec<NameServerConfig> = ResolverConfig::udp_and_tcp(&GOOGLE)
+            .name_servers()
+            .to_owned();
+
+        let mut resolver_builder = Resolver::<R>::builder_with_config(
+            ResolverConfig::from_parts(Some(domain), search, name_servers),
+            handle,
+        );
+        // matches kubernetes default
+        resolver_builder.options_mut().ndots = 5;
+        resolver_builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only;
+        let resolver = resolver_builder.build().unwrap();
+
+        // notice this is not a FQDN, no trailing dot.
+        let response = resolver
+            .lookup_ip("www.example.com")
+            .await
+            .expect("failed to run lookup");
+
+        assert_ne!(response.iter().count(), 0);
+        for address in response.iter() {
+            assert!(address.is_ipv4(), "should only be looking up IPv4");
+        }
+    }
+
+    /// Test domain search.
+    pub(crate) async fn domain_search_test<R: ConnectionProvider>(handle: R) {
+        // domain is good now, should be combined with the name to form www.example.com
+        let domain = Name::from_str("example.com.").unwrap();
+        let search = vec![
+            Name::from_str("bad.example.com.").unwrap(),
+            Name::from_str("wrong.example.com.").unwrap(),
+        ];
+        let name_servers: Vec<NameServerConfig> = ResolverConfig::udp_and_tcp(&GOOGLE)
+            .name_servers()
+            .to_owned();
+
+        let mut resolver_builder = Resolver::<R>::builder_with_config(
+            ResolverConfig::from_parts(Some(domain), search, name_servers),
+            handle,
+        );
+        resolver_builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only;
+        let resolver = resolver_builder.build().unwrap();
+
+        // notice no dots, should not trigger ndots rule
+        let response = resolver
+            .lookup_ip("www")
+            .await
+            .expect("failed to run lookup");
+
+        assert_ne!(response.iter().count(), 0);
+        for address in response.iter() {
+            assert!(address.is_ipv4(), "should only be looking up IPv4");
+        }
+    }
+
+    /// Test search lists.
+    pub(crate) async fn search_list_test<R: ConnectionProvider>(handle: R) {
+        let domain = Name::from_str("incorrect.example.com.").unwrap();
+        let search = vec![
+            // let's skip one search domain to test the loop...
+            Name::from_str("bad.example.com.").unwrap(),
+            // this should combine with the search name to form www.example.com
+            Name::from_str("example.com.").unwrap(),
+        ];
+        let name_servers: Vec<NameServerConfig> = ResolverConfig::udp_and_tcp(&GOOGLE)
+            .name_servers()
+            .to_owned();
+
+        let mut resolver_builder = Resolver::<R>::builder_with_config(
+            ResolverConfig::from_parts(Some(domain), search, name_servers),
+            handle,
+        );
+        resolver_builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only;
+        let resolver = resolver_builder.build().unwrap();
+
+        // notice no dots, should not trigger ndots rule
+        let response = resolver
+            .lookup_ip("www")
+            .await
+            .expect("failed to run lookup");
+
+        assert_ne!(response.iter().count(), 0);
+        for address in response.iter() {
+            assert!(address.is_ipv4(), "should only be looking up IPv4");
+        }
+    }
+
+    /// Test idna.
+    pub(crate) async fn idna_test<R: ConnectionProvider>(handle: R) {
+        let resolver =
+            Resolver::<R>::builder_with_config(ResolverConfig::udp_and_tcp(&GOOGLE), handle)
+                .build()
+                .unwrap();
+
+        let response = resolver
+            .lookup_ip("中国.icom.museum.")
+            .await
+            .expect("failed to run lookup");
+
+        // we just care that the request succeeded, not about the actual content
+        //   it's not certain that the ip won't change.
+        assert!(response.iter().next().is_some());
+    }
+
+    /// Test ipv4 localhost.
+    pub(crate) async fn localhost_ipv4_test<R: ConnectionProvider>(handle: R) {
+        let mut resolver_builder =
+            Resolver::<R>::builder_with_config(ResolverConfig::udp_and_tcp(&GOOGLE), handle);
+        resolver_builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
+        let resolver = resolver_builder.build().unwrap();
+
+        let response = resolver
+            .lookup_ip("localhost")
+            .await
+            .expect("failed to run lookup");
+
+        let mut iter = response.iter();
+        assert_eq!(iter.next().expect("no A"), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    /// Test ipv6 localhost.
+    pub(crate) async fn localhost_ipv6_test<R: ConnectionProvider>(handle: R) {
+        let mut resolver_builder =
+            Resolver::<R>::builder_with_config(ResolverConfig::udp_and_tcp(&GOOGLE), handle);
+        resolver_builder.options_mut().ip_strategy = LookupIpStrategy::Ipv6thenIpv4;
+        let resolver = resolver_builder.build().unwrap();
+
+        let response = resolver
+            .lookup_ip("localhost")
+            .await
+            .expect("failed to run lookup");
+
+        let mut iter = response.iter();
+        assert_eq!(
+            iter.next().expect("no AAAA"),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+    }
+
+    /// Test ipv4 search with large ndots.
+    pub(crate) async fn search_ipv4_large_ndots_test<R: ConnectionProvider>(handle: R) {
+        let mut config = ResolverConfig::udp_and_tcp(&GOOGLE);
+        config.add_search(Name::from_str("example.com").unwrap());
+
+        let mut resolver_builder = Resolver::<R>::builder_with_config(config, handle);
+        resolver_builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only;
+        resolver_builder.options_mut().ndots = 5;
+        let resolver = resolver_builder.build().unwrap();
+
+        let response = resolver
+            .lookup_ip("198.51.100.35")
+            .await
+            .expect("failed to run lookup");
+
+        let mut iter = response.iter();
+        assert_eq!(
+            iter.next().expect("no rdatas"),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 35))
+        );
+    }
+
+    /// Test ipv6 search with large ndots.
+    pub(crate) async fn search_ipv6_large_ndots_test<R: ConnectionProvider>(handle: R) {
+        let mut config = ResolverConfig::udp_and_tcp(&GOOGLE);
+        config.add_search(Name::from_str("example.com").unwrap());
+
+        let mut resolver_builder = Resolver::<R>::builder_with_config(config, handle);
+        resolver_builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only;
+        resolver_builder.options_mut().ndots = 5;
+        let resolver = resolver_builder.build().unwrap();
+
+        let response = resolver
+            .lookup_ip("2001:db8::c633:6423")
+            .await
+            .expect("failed to run lookup");
+
+        let mut iter = response.iter();
+        assert_eq!(
+            iter.next().expect("no rdatas"),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0xc633, 0x6423))
+        );
+    }
+
+    /// Test ipv6 name parse fails.
+    pub(crate) async fn search_ipv6_name_parse_fails_test<R: ConnectionProvider>(handle: R) {
+        let mut config = ResolverConfig::udp_and_tcp(&GOOGLE);
+        config.add_search(Name::from_str("example.com").unwrap());
+
+        let mut resolver_builder = Resolver::<R>::builder_with_config(config, handle);
+        resolver_builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only;
+        resolver_builder.options_mut().ndots = 5;
+        let resolver = resolver_builder.build().unwrap();
+
+        let response = resolver
+            .lookup_ip("2001:db8::198.51.100.35")
+            .await
+            .expect("failed to run lookup");
+
+        let mut iter = response.iter();
+        assert_eq!(
+            iter.next().expect("no rdatas"),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0xc633, 0x6423))
+        );
+    }
 }
 
 #[cfg(test)]
+#[cfg(feature = "tokio")]
+#[allow(clippy::extra_unused_type_parameters)]
 mod tests {
-    #![allow(clippy::dbg_macro, clippy::print_stdout)]
+    use std::net::{IpAddr, Ipv4Addr};
 
-    use std::net::*;
+    use test_support::subscribe;
+    #[cfg(feature = "__dnssec")]
+    use test_support::{MockNetworkHandler, MockProvider, MockResponse};
 
+    #[cfg(all(unix, feature = "system-config"))]
+    use super::testing::hosts_lookup_test;
+    #[cfg(feature = "system-config")]
+    use super::testing::system_lookup_test;
+    use super::testing::{
+        domain_search_test, fqdn_test, idna_test, ip_lookup_across_threads_test, ip_lookup_test,
+        large_ndots_test, localhost_ipv4_test, localhost_ipv6_test, lookup_test, ndots_test,
+        search_ipv4_large_ndots_test, search_ipv6_large_ndots_test,
+        search_ipv6_name_parse_fails_test, search_list_test,
+    };
+    #[cfg(feature = "__dnssec")]
+    use super::testing::{sec_lookup_fails_test, sec_lookup_test};
     use super::*;
+    #[cfg(feature = "__dnssec")]
+    use crate::config::ServerGroup;
+    use crate::config::{CLOUDFLARE, GOOGLE, ResolverConfig, ResolverOpts};
+    use crate::lookup_ip::tests::{empty, error, mock, v4_message};
+    use crate::net::DnsError;
+    use crate::net::xfer::DnsExchange;
+    #[cfg(feature = "__dnssec")]
+    use crate::proto::dnssec::{SigningKey, crypto::Ed25519SigningKey};
 
-    fn require_send_sync<S: Send + Sync>() {}
+    fn is_send_t<T: Send>() -> bool {
+        true
+    }
 
-    #[test]
-    fn test_resolver_sendable() {
-        require_send_sync::<Resolver>();
+    fn is_sync_t<T: Sync>() -> bool {
+        true
     }
 
     #[test]
-    fn test_lookup() {
-        let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default()).unwrap();
+    fn test_send_sync() {
+        assert!(is_send_t::<ResolverConfig>());
+        assert!(is_sync_t::<ResolverConfig>());
+        assert!(is_send_t::<ResolverOpts>());
+        assert!(is_sync_t::<ResolverOpts>());
 
-        let response = resolver.lookup_ip("www.example.com.").unwrap();
-        println!("response records: {response:?}");
+        assert!(is_send_t::<Resolver<TokioRuntimeProvider>>());
+        assert!(is_sync_t::<Resolver<TokioRuntimeProvider>>());
 
-        assert_eq!(response.iter().count(), 1);
-        for address in response.iter() {
-            if address.is_ipv4() {
-                assert_eq!(address, IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)));
-            } else {
-                assert_eq!(
-                    address,
-                    IpAddr::V6(Ipv6Addr::new(
-                        0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c,
-                    ))
-                );
-            }
-        }
+        assert!(is_send_t::<DnsRequest>());
+        assert!(is_send_t::<LookupIpFuture<DnsExchange<TokioRuntimeProvider>>>());
+        assert!(is_send_t::<LookupFuture<DnsExchange<TokioRuntimeProvider>>>());
+    }
+
+    #[tokio::test]
+    async fn test_lookup_google() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        lookup_test(ResolverConfig::udp_and_tcp(&GOOGLE), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_lookup_cloudflare() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        lookup_test(ResolverConfig::udp_and_tcp(&CLOUDFLARE), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_ip_lookup() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        ip_lookup_test(handle).await;
     }
 
     #[test]
+    fn test_ip_lookup_across_threads() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        ip_lookup_across_threads_test(handle);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "__dnssec")]
+    #[ignore = "flaky test against internet server"]
+    async fn test_sec_lookup() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        sec_lookup_test(handle).await;
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "__dnssec")]
+    #[ignore = "flaky test against internet server"]
+    async fn test_sec_lookup_fails() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        sec_lookup_fails_test(handle).await;
+    }
+
+    #[tokio::test]
     #[ignore]
     #[cfg(any(unix, target_os = "windows"))]
     #[cfg(feature = "system-config")]
-    fn test_system_lookup() {
-        let resolver = Resolver::from_system_conf().unwrap();
+    async fn test_system_lookup() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        system_lookup_test(handle).await;
+    }
 
-        let response = resolver.lookup_ip("www.example.com.").unwrap();
-        println!("response records: {response:?}");
+    // these appear to not work on CI, test on macos with `10.1.0.104  a.com`
+    #[tokio::test]
+    #[ignore]
+    #[cfg(all(unix, feature = "system-config"))]
+    async fn test_hosts_lookup() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        hosts_lookup_test(handle).await;
+    }
 
-        assert_eq!(response.iter().count(), 1);
-        for address in response.iter() {
-            if address.is_ipv4() {
-                assert_eq!(address, IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)));
-            } else {
-                assert_eq!(
-                    address,
-                    IpAddr::V6(Ipv6Addr::new(
-                        0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c,
-                    ))
-                );
-            }
+    #[tokio::test]
+    async fn test_fqdn() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        fqdn_test(handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_ndots() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        ndots_test(handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_large_ndots() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        large_ndots_test(handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_domain_search() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        domain_search_test(handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_search_list() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        search_list_test(handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_idna() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        idna_test(handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_localhost_ipv4() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        localhost_ipv4_test(handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_localhost_ipv6() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        localhost_ipv6_test(handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_search_ipv4_large_ndots() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        search_ipv4_large_ndots_test(handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_search_ipv6_large_ndots() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        search_ipv6_large_ndots_test(handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_search_ipv6_name_parse_fails() {
+        subscribe();
+        let handle = TokioRuntimeProvider::default();
+        search_ipv6_name_parse_fails_test(handle).await;
+    }
+
+    #[test]
+    fn test_build_names() {
+        use std::str::FromStr;
+
+        let handle = TokioRuntimeProvider::default();
+        let mut config = ResolverConfig::udp_and_tcp(&GOOGLE);
+        config.add_search(Name::from_ascii("example.com.").unwrap());
+        let resolver = Resolver::builder_with_config(config, handle)
+            .build()
+            .unwrap();
+
+        assert_eq!(resolver.build_names(Name::from_str("").unwrap()).len(), 2);
+        assert_eq!(resolver.build_names(Name::from_str(".").unwrap()).len(), 1);
+
+        let fqdn = Name::from_str("foo.example.com.").unwrap();
+        let name_list = resolver.build_names(Name::from_str("foo").unwrap());
+        assert!(name_list.contains(&fqdn));
+
+        let name_list = resolver.build_names(fqdn.clone());
+        assert_eq!(name_list.len(), 1);
+        assert_eq!(name_list.first(), Some(&fqdn));
+    }
+
+    #[test]
+    fn test_build_names_onion() {
+        let handle = TokioRuntimeProvider::default();
+        let mut config = ResolverConfig::udp_and_tcp(&GOOGLE);
+        config.add_search(Name::from_ascii("example.com.").unwrap());
+        let resolver = Resolver::builder_with_config(config, handle)
+            .build()
+            .unwrap();
+        let tor_address = [
+            Name::from_ascii("2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion")
+                .unwrap(),
+            Name::from_ascii("www.2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion")
+                .unwrap(), // subdomain are allowed too
+        ];
+        let not_tor_address = [
+            Name::from_ascii("onion").unwrap(),
+            Name::from_ascii("www.onion").unwrap(),
+            Name::from_ascii("2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.www.onion")
+                .unwrap(), // www before key
+            Name::from_ascii("2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion.to")
+                .unwrap(), // Tor2web
+        ];
+        for name in &tor_address {
+            assert_eq!(resolver.build_names(name.clone()).len(), 1);
         }
+        for name in &not_tor_address {
+            assert_eq!(resolver.build_names(name.clone()).len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lookup() {
+        assert_eq!(
+            LookupFuture::lookup(
+                vec![Name::root()],
+                RecordType::A,
+                DnsRequestOptions::default(),
+                CachingClient::new(0, mock(vec![v4_message()]), false),
+            )
+            .await
+            .unwrap()
+            .answers()
+            .iter()
+            .map(|r| r.data.ip_addr().unwrap())
+            .collect::<Vec<IpAddr>>(),
+            vec![Ipv4Addr::LOCALHOST]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lookup_slice() {
+        assert_eq!(
+            LookupFuture::lookup(
+                vec![Name::root()],
+                RecordType::A,
+                DnsRequestOptions::default(),
+                CachingClient::new(0, mock(vec![v4_message()]), false),
+            )
+            .await
+            .unwrap()
+            .answers()[0]
+                .data
+                .ip_addr()
+                .unwrap(),
+            Ipv4Addr::LOCALHOST
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lookup_into_iter() {
+        assert_eq!(
+            LookupFuture::lookup(
+                vec![Name::root()],
+                RecordType::A,
+                DnsRequestOptions::default(),
+                CachingClient::new(0, mock(vec![v4_message()]), false),
+            )
+            .await
+            .unwrap()
+            .answers()
+            .iter()
+            .map(|r| r.data.ip_addr().unwrap())
+            .collect::<Vec<IpAddr>>(),
+            vec![Ipv4Addr::LOCALHOST]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error() {
+        assert!(
+            LookupFuture::lookup(
+                vec![Name::root()],
+                RecordType::A,
+                DnsRequestOptions::default(),
+                CachingClient::new(0, mock(vec![error()]), false),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_no_response() {
+        let error = LookupFuture::lookup(
+            vec![Name::root()],
+            RecordType::A,
+            DnsRequestOptions::default(),
+            CachingClient::new(0, mock(vec![empty()]), false),
+        )
+        .await
+        .expect_err("this should have been a NoRecordsFound");
+
+        let NetError::Dns(DnsError::NoRecordsFound(no_records)) = error else {
+            panic!("wrong error received");
+        };
+
+        assert_eq!(*no_records.query, Query::new(Name::root(), RecordType::A));
+        assert_eq!(no_records.negative_ttl, None);
+    }
+
+    #[cfg(feature = "__dnssec")]
+    #[tokio::test]
+    async fn test_dnssec_validation_bogus_fails() {
+        subscribe();
+
+        let mut trust_anchors = TrustAnchors::empty();
+        let private_key =
+            Ed25519SigningKey::from_pkcs8(&Ed25519SigningKey::generate_pkcs8().unwrap()).unwrap();
+        let public_key = private_key.to_public_key().unwrap();
+        trust_anchors.insert(&public_key, Name::root().into());
+
+        let resolver_ip = Ipv4Addr::new(203, 0, 113, 1).into();
+        let query_name = Name::parse("www.hickory-dns.testing.", None).unwrap();
+        let zone_name = Name::parse("hickory-dns.testing.", None).unwrap();
+        let mname = Name::parse("ns.testing.", None).unwrap();
+        let rname = Name::parse("admin.hickory-dns.testing.", None).unwrap();
+        let tld_name = Name::parse("testing.", None).unwrap();
+
+        let mock_records = vec![
+            // Positive response for A query.
+            MockResponse::new(resolver_ip, &query_name, RecordType::A)
+                .a(&query_name, Ipv4Addr::new(203, 0, 113, 2)),
+            // Negative response for AAAA query.
+            MockResponse::new(resolver_ip, &query_name, RecordType::AAAA)
+                .soa_authority(&zone_name, &mname, &rname),
+            // Negative response when checking for zone cut at QNAME.
+            MockResponse::new(resolver_ip, &query_name, RecordType::NS)
+                .soa_authority(&zone_name, &mname, &rname),
+            // Return NS RRset when checking for zone cut.
+            MockResponse::new(resolver_ip, &zone_name, RecordType::NS)
+                .ns_answer(&zone_name, &mname),
+            MockResponse::new(resolver_ip, &tld_name, RecordType::NS).ns_answer(&tld_name, &mname),
+            // Negative response when querying any DS RRset. This should cause DNSSEC validation to
+            // fail. (Plus, synthesizing records would be hard without moving tests to the
+            // hickory-integration crate.)
+            MockResponse::new(resolver_ip, &zone_name, RecordType::DS)
+                .soa_authority(&tld_name, &mname, &rname),
+            MockResponse::new(resolver_ip, &tld_name, RecordType::DS).soa_authority(
+                &Name::root(),
+                &mname,
+                &rname,
+            ),
+        ];
+        let handler = MockNetworkHandler::new(mock_records);
+        let provider = MockProvider::new(handler);
+
+        let server_group = ServerGroup {
+            ips: &[resolver_ip],
+            server_name: "ns.testing",
+            path: "/dns-query",
+        };
+        let resolver_config = ResolverConfig::udp_and_tcp(&server_group);
+        let resolver = Resolver::builder_with_config(resolver_config, provider)
+            .with_trust_anchor(Arc::new(trust_anchors))
+            .build()
+            .unwrap();
+
+        let error = resolver.lookup_ip(query_name).await.unwrap_err();
+        assert!(
+            error.to_string().contains("DNSSEC validation failed"),
+            "{error}"
+        );
     }
 }

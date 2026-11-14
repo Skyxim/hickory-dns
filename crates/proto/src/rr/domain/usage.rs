@@ -9,32 +9,11 @@
 //!
 //! see [Special-Use Domain Names](https://tools.ietf.org/html/rfc6761), RFC 6761 February, 2013
 
-use std::ops::Deref;
-
-use once_cell::sync::Lazy;
+use core::iter;
 
 use crate::rr::domain::Name;
 
-/// Default Name usage, everything is normal...
-pub static DEFAULT: Lazy<ZoneUsage> = Lazy::new(ZoneUsage::default);
-
-static ARPA: Lazy<Name> = Lazy::new(|| Name::from_ascii("arpa.").unwrap());
-/// zone for ipv4 reverse addresses
-pub static IN_ADDR_ARPA: Lazy<Name> = Lazy::new(|| {
-    Name::from_ascii("in-addr")
-        .unwrap()
-        .append_domain(&ARPA)
-        .unwrap()
-});
-/// zone for ipv6 reverse addresses
-pub static IP6_ARPA: Lazy<Name> = Lazy::new(|| {
-    Name::from_ascii("ip6")
-        .unwrap()
-        .append_domain(&ARPA)
-        .unwrap()
-});
-
-/// localhost.
+/// Returns true if `name` falls within `localhost.`
 ///
 /// [Special-Use Domain Names](https://tools.ietf.org/html/rfc6761), RFC 6761 February, 2013
 ///
@@ -44,32 +23,32 @@ pub static IP6_ARPA: Lazy<Name> = Lazy::new(|| {
 ///    The domain "localhost." and any names falling within ".localhost."
 ///    are special in the following ways:
 /// ```
+pub(super) fn is_localhost(name: &Name) -> bool {
+    in_zone(name, ["localhost"])
+}
 
-/// localhost. usage
-pub static LOCALHOST: Lazy<ZoneUsage> =
-    Lazy::new(|| ZoneUsage::localhost(Name::from_ascii("localhost.").unwrap()));
+/// Returns true if `name` falls within `127.in-addr.arpa.`
+///
+/// 127/8 is reserved for loopback.
+pub(super) fn is_in_addr_arpa_127(name: &Name) -> bool {
+    in_zone(name, ["arpa", "in-addr", "127"])
+}
 
-/// 127.in-addr.arpa. usage; 127/8 is reserved for loopback
-pub static IN_ADDR_ARPA_127: Lazy<ZoneUsage> = Lazy::new(|| {
-    ZoneUsage::localhost(
-        Name::from_ascii("127")
-            .unwrap()
-            .append_domain(&IN_ADDR_ARPA)
-            .unwrap(),
+/// Returns true if `name` falls within `1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.`
+///
+/// `::1/128` is the only address in ipv6 loopback, so names in this zone should be treated
+/// like [`is_localhost()`] names.
+pub(super) fn is_ip6_arpa_loopback(name: &Name) -> bool {
+    in_zone(
+        name,
+        ["arpa", "ip6"]
+            .into_iter()
+            .chain(iter::repeat_n("0", 31))
+            .chain(["1"]),
     )
-});
+}
 
-/// 1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa. usage; 1/128 is the only address in ipv6 loopback
-pub static IP6_ARPA_1: Lazy<ZoneUsage> = Lazy::new(|| {
-    ZoneUsage::localhost(
-        Name::from_ascii("1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0")
-            .unwrap()
-            .append_domain(&IP6_ARPA)
-            .unwrap(),
-    )
-});
-
-/// .local.
+/// Returns true if `name` falls within `local.`
 ///
 /// [Multicast DNS](https://tools.ietf.org/html/rfc6762), RFC 6762  February 2013
 ///
@@ -82,65 +61,13 @@ pub static IP6_ARPA_1: Lazy<ZoneUsage> = Lazy::new(|| {
 ///   addresses in the FE80::/10 prefix, which are link-local and
 ///   meaningful only on the link where they originate.
 /// ```
-
-/// localhost. usage
-pub static LOCAL: Lazy<ZoneUsage> =
-    Lazy::new(|| ZoneUsage::local(Name::from_ascii("local.").unwrap()));
+pub(super) fn is_local(name: &Name) -> bool {
+    in_zone(name, ["local"])
+}
 
 // RFC 6762                      Multicast DNS                February 2013
 
-// Any DNS query for a name ending with "254.169.in-addr.arpa." MUST
-//  be sent to the mDNS IPv4 link-local multicast address 224.0.0.251
-//  or the mDNS IPv6 multicast address FF02::FB.  Since names under
-//  this domain correspond to IPv4 link-local addresses, it is logical
-//  that the local link is the best place to find information
-//  pertaining to those names.
-//
-//  Likewise, any DNS query for a name within the reverse mapping
-//  domains for IPv6 link-local addresses ("8.e.f.ip6.arpa.",
-//  "9.e.f.ip6.arpa.", "a.e.f.ip6.arpa.", and "b.e.f.ip6.arpa.") MUST
-//  be sent to the mDNS IPv6 link-local multicast address FF02::FB or
-//  the mDNS IPv4 link-local multicast address 224.0.0.251.
-
-/// 254.169.in-addr.arpa. usage link-local, i.e. mDNS
-pub static IN_ADDR_ARPA_169_254: Lazy<ZoneUsage> = Lazy::new(|| {
-    ZoneUsage::local(
-        Name::from_ascii("254.169")
-            .unwrap()
-            .append_domain(&IN_ADDR_ARPA)
-            .unwrap(),
-    )
-});
-
-/// 254.169.in-addr.arpa. usage link-local, i.e. mDNS
-pub static IP6_ARPA_FE_8: Lazy<ZoneUsage> = Lazy::new(|| {
-    ZoneUsage::local(
-        Name::from_ascii("8.e.f")
-            .unwrap()
-            .append_domain(&IP6_ARPA)
-            .unwrap(),
-    )
-});
-/// 254.169.in-addr.arpa. usage link-local, i.e. mDNS
-pub static IP6_ARPA_FE_9: Lazy<ZoneUsage> = Lazy::new(|| {
-    ZoneUsage::local(
-        Name::from_ascii("9.e.f")
-            .unwrap()
-            .append_domain(&IP6_ARPA)
-            .unwrap(),
-    )
-});
-/// 254.169.in-addr.arpa. usage link-local, i.e. mDNS
-pub static IP6_ARPA_FE_B: Lazy<ZoneUsage> = Lazy::new(|| {
-    ZoneUsage::local(
-        Name::from_ascii("b.e.f")
-            .unwrap()
-            .append_domain(&IP6_ARPA)
-            .unwrap(),
-    )
-});
-
-/// invalid.
+/// Returns true if `name` falls within `invalid.`
 ///
 /// [Special-Use Domain Names](https://tools.ietf.org/html/rfc6761), RFC 6761 February, 2013
 ///
@@ -152,12 +79,11 @@ pub static IP6_ARPA_FE_B: Lazy<ZoneUsage> = Lazy::new(|| {
 ///    "invalid" is used in quotes to signify such names, as opposed to
 ///    names that may be invalid for other reasons (e.g., being too long).
 /// ```
+pub(super) fn is_invalid(name: &Name) -> bool {
+    in_zone(name, ["invalid"])
+}
 
-/// invalid. name usage
-pub static INVALID: Lazy<ZoneUsage> =
-    Lazy::new(|| ZoneUsage::invalid(Name::from_ascii("invalid.").unwrap()));
-
-/// invalid.
+/// Returns true if `name` falls within `onion.`
 ///
 /// [The ".onion" Special-Use Domain Name](https://tools.ietf.org/html/rfc7686), RFC 7686 October, 2015
 ///
@@ -171,75 +97,18 @@ pub static INVALID: Lazy<ZoneUsage> =
 ///   functionally correspond to the identity of a given service, thereby
 ///   combining location and authentication.
 /// ```
-
-/// onion. name usage
-pub static ONION: Lazy<ZoneUsage> = Lazy::new(|| ZoneUsage {
-    user: UserUsage::Normal, // the domain is special, but this is what seems to match the most
-    app: AppUsage::Normal,   // the domain is special, but this is what seems to match the most
-    ..ZoneUsage::invalid(Name::from_ascii("onion.").unwrap())
-});
-
-/// Users:
-///
-///   Are human users expected to recognize these names as special and
-///   use them differently?  In what way?
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum UserUsage {
-    /// Users are free to use these names as they would any other
-    /// reverse-mapping names.  However, since there is no central
-    /// authority responsible for use of private addresses, users SHOULD
-    /// be aware that these names are likely to yield different results
-    /// on different networks.
-    Normal,
-
-    /// Users are free to use localhost names as they would any other
-    /// domain names.  Users may assume that IPv4 and IPv6 address
-    /// queries for localhost names will always resolve to the respective
-    /// IP loopback address.
-    Loopback,
-
-    /// Multi-cast link-local usage
-    LinkLocal,
-
-    /// Users are free to use "invalid" names as they would any other
-    /// domain names.  Users MAY assume that queries for "invalid" names
-    /// will always return NXDOMAIN responses.
-    NxDomain,
+pub fn is_onion(name: &Name) -> bool {
+    in_zone(name, ["onion"])
 }
 
-/// Application Software:
-///
-///   Are writers of application software expected to make their
-///   software recognize these names as special and treat them
-///   differently?  In what way?  (For example, if a human user enters
-///   such a name, should the application software reject it with an
-///   error message?)
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AppUsage {
-    /// Application software SHOULD NOT recognize these names as special,
-    /// and SHOULD use these names as they would other reverse-mapping
-    /// names.
-    ///
-    /// Application software SHOULD NOT recognize test names as special,
-    /// and SHOULD use test names as they would other domain names.
-    ///
-    /// Application software SHOULD NOT recognize example names as
-    /// special and SHOULD use example names as they would other domain
-    /// names.
-    Normal,
-
-    /// Application software MAY recognize localhost names as special, or
-    /// MAY pass them to name resolution APIs as they would for other
-    /// domain names.
-    Loopback,
-
-    /// Link local, generally for mDNS
-    LinkLocal,
-
-    /// Application software MAY recognize "invalid" names as special or
-    /// MAY pass them to name resolution APIs as they would for other
-    /// domain names.
-    NxDomain,
+/// Returns true if the trailing labels of `name` match `zone` (given from the root down)
+fn in_zone(name: &Name, zone: impl IntoIterator<Item = &'static str>) -> bool {
+    let mut labels = name.iter().rev();
+    zone.into_iter().all(|expected| {
+        labels
+            .next()
+            .is_some_and(|label| label.eq_ignore_ascii_case(expected.as_bytes()))
+    })
 }
 
 /// Name Resolution APIs and Libraries:
@@ -294,341 +163,89 @@ pub enum ResolverUsage {
     NxDomain,
 }
 
-/// Caching DNS Servers:
-///
-///   Are developers of caching domain name servers expected to make
-///   their implementations recognize these names as special and treat
-///   them differently?  If so, how?
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum CacheUsage {
-    /// Caching DNS servers SHOULD recognize these names as special and
-    /// SHOULD NOT, by default, attempt to look up NS records for them,
-    /// or otherwise query authoritative DNS servers in an attempt to
-    /// resolve these names.  Instead, caching DNS servers SHOULD, by
-    /// default, generate immediate (positive or negative) responses for
-    /// all such queries.  This is to avoid unnecessary load on the root
-    /// name servers and other name servers.  Caching DNS servers SHOULD
-    /// offer a configuration option (disabled by default) to enable
-    /// upstream resolution of such names, for use in private networks
-    /// where private-address reverse-mapping names are known to be
-    /// handled by an authoritative DNS server in said private network.
-    NonRecursive,
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
 
-    /// Caching DNS servers SHOULD recognize "invalid" names as special
-    /// and SHOULD NOT attempt to look up NS records for them, or
-    /// otherwise query authoritative DNS servers in an attempt to
-    /// resolve "invalid" names.  Instead, caching DNS servers SHOULD
-    /// generate immediate NXDOMAIN responses for all such queries.  This
-    /// is to avoid unnecessary load on the root name servers and other
-    /// name servers.
-    NxDomain,
+    use super::*;
 
-    /// Caching DNS servers SHOULD recognize localhost names as special
-    /// and SHOULD NOT attempt to look up NS records for them, or
-    /// otherwise query authoritative DNS servers in an attempt to
-    /// resolve localhost names.  Instead, caching DNS servers SHOULD,
-    /// for all such address queries, generate an immediate positive
-    /// response giving the IP loopback address, and for all other query
-    /// types, generate an immediate negative response.  This is to avoid
-    /// unnecessary load on the root name servers and other name servers.
-    Loopback,
+    #[test]
+    fn single_label_zones() {
+        for (predicate, zone) in [
+            (is_localhost as fn(&Name) -> bool, "localhost"),
+            (is_local, "local"),
+            (is_invalid, "invalid"),
+            (is_onion, "onion"),
+        ] {
+            for name in [
+                zone.to_string(),
+                format!("{zone}."),
+                zone.to_ascii_uppercase(),
+                format!("foo.{zone}."),
+            ] {
+                assert!(predicate(&Name::from_ascii(&name).unwrap()), "{name}");
+            }
 
-    /// Caching DNS servers SHOULD NOT recognize example names as special
-    /// and SHOULD resolve them normally.
-    Normal,
-}
-
-/// Authoritative DNS Servers:
-///
-///   Are developers of authoritative domain name servers expected to
-///   make their implementations recognize these names as special and
-///   treat them differently?  If so, how?
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AuthUsage {
-    /// Authoritative DNS servers SHOULD recognize these names as special
-    /// and SHOULD, by default, generate immediate negative responses for
-    /// all such queries, unless explicitly configured by the
-    /// administrator to give positive answers for private-address
-    /// reverse-mapping names.
-    Local,
-
-    /// Authoritative DNS servers SHOULD recognize these names as special
-    /// and SHOULD, by default, generate immediate negative responses for
-    /// all such queries, unless explicitly configured by the
-    /// administrator to give positive answers for private-address
-    /// reverse-mapping names.
-    NxDomain,
-
-    /// Authoritative DNS servers SHOULD recognize localhost names as
-    /// special and handle them as described above for caching DNS
-    /// servers.
-    Loopback,
-
-    /// Authoritative DNS servers SHOULD NOT recognize example names as
-    /// special.
-    Normal,
-}
-
-/// DNS Server Operators:
-///
-///   Does this reserved Special-Use Domain Name have any potential
-///   impact on DNS server operators?  If they try to configure their
-///   authoritative DNS server as authoritative for this reserved name,
-///   will compliant name server software reject it as invalid?  Do DNS
-///   server operators need to know about that and understand why?
-///   Even if the name server software doesn't prevent them from using
-///   this reserved name, are there other ways that it may not work as
-///  expected, of which the DNS server operator should be aware?
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum OpUsage {
-    /// DNS server operators SHOULD, if they are using private addresses,
-    /// configure their authoritative DNS servers to act as authoritative
-    /// for these names.
-    ///
-    /// DNS server operators SHOULD, if they are using test names,
-    /// configure their authoritative DNS servers to act as authoritative
-    /// for test names.
-    Normal,
-
-    /// DNS server operators SHOULD be aware that the effective RDATA for
-    /// localhost names is defined by protocol specification and cannot
-    /// be modified by local configuration.
-    Loopback,
-
-    /// DNS server operators SHOULD be aware that the effective RDATA for
-    /// "invalid" names is defined by protocol specification to be
-    /// nonexistent and cannot be modified by local configuration.
-    NxDomain,
-}
-
-/// DNS Registries/Registrars:
-///
-///   How should DNS Registries/Registrars treat requests to register
-///   this reserved domain name?  Should such requests be denied?
-///   Should such requests be allowed, but only to a specially-
-///   designated entity?  (For example, the name "www.example.org" is
-///   reserved for documentation examples and is not available for
-///   registration; however, the name is in fact registered; and there
-///   is even a web site at that name, which states circularly that the
-///   name is reserved for use in documentation and cannot be
-///   registered!)
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RegistryUsage {
-    /// Stanard checks apply
-    Normal,
-
-    /// DNS Registries/Registrars MUST NOT grant requests to register
-    /// test names in the normal way to any person or entity.  Test names
-    /// are reserved for use in private networks and fall outside the set
-    /// of names available for allocation by registries/registrars.
-    /// Attempting to allocate a test name as if it were a normal DNS
-    /// domain name will probably not work as desired, for reasons 4, 5,
-    /// and 6 above.
-    ///
-    /// DNS Registries/Registrars MUST NOT grant requests to register
-    /// localhost names in the normal way to any person or entity.
-    /// Localhost names are defined by protocol specification and fall
-    /// outside the set of names available for allocation by registries/
-    /// registrars.  Attempting to allocate a localhost name as if it
-    /// were a normal DNS domain name will probably not work as desired,
-    /// for reasons 2, 3, 4, and 5 above.
-    ///
-    /// DNS Registries/Registrars MUST NOT grant requests to register
-    /// "invalid" names in the normal way to any person or entity.  These
-    /// "invalid" names are defined by protocol specification to be
-    /// nonexistent, and they fall outside the set of names available for
-    /// allocation by registries/registrars.  Attempting to allocate a
-    /// "invalid" name as if it were a normal DNS domain name will
-    /// probably not work as desired, for reasons 2, 3, 4, and 5 above.
-    ///
-    /// DNS Registries/Registrars MUST NOT grant requests to register
-    /// example names in the normal way to any person or entity.  All
-    /// example names are registered in perpetuity to IANA:
-    Reserved,
-}
-
-/// ZoneUsage represents information about how a name falling in a given zone should be treated
-pub struct ZoneUsage {
-    name: Name,
-    user: UserUsage,
-    app: AppUsage,
-    resolver: ResolverUsage,
-    cache: CacheUsage,
-    auth: AuthUsage,
-    op: OpUsage,
-    registry: RegistryUsage,
-}
-
-impl ZoneUsage {
-    /// Constructs a new ZoneUsage with the associated values
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        name: Name,
-        user: UserUsage,
-        app: AppUsage,
-        resolver: ResolverUsage,
-        cache: CacheUsage,
-        auth: AuthUsage,
-        op: OpUsage,
-        registry: RegistryUsage,
-    ) -> Self {
-        Self {
-            name,
-            user,
-            app,
-            resolver,
-            cache,
-            auth,
-            op,
-            registry,
+            for name in [
+                ".".to_string(),
+                "example.".to_string(),
+                format!("{zone}.example."),
+                format!("{zone}x."),
+            ] {
+                assert!(!predicate(&Name::from_ascii(&name).unwrap()), "{name}");
+            }
         }
     }
 
-    /// Restrictions for reverse zones
-    pub fn reverse(name: Name) -> Self {
-        Self::new(
-            name,
-            UserUsage::Normal,
-            AppUsage::Normal,
-            ResolverUsage::Normal,
-            CacheUsage::NonRecursive,
-            AuthUsage::Local,
-            OpUsage::Normal,
-            RegistryUsage::Reserved,
-        )
+    #[test]
+    fn in_addr_arpa_127() {
+        for name in ["127.in-addr.arpa.", "1.0.0.127.IN-ADDR.ARPA."] {
+            assert!(
+                is_in_addr_arpa_127(&Name::from_ascii(name).unwrap()),
+                "{name}"
+            );
+        }
+
+        for name in [
+            "in-addr.arpa.",
+            "128.in-addr.arpa.",
+            "1.0.0.127.in-addr.example.",
+        ] {
+            assert!(
+                !is_in_addr_arpa_127(&Name::from_ascii(name).unwrap()),
+                "{name}"
+            );
+        }
     }
 
-    /// Restrictions for the .test. zone
-    pub fn test(name: Name) -> Self {
-        Self::new(
-            name,
-            UserUsage::Normal,
-            AppUsage::Normal,
-            ResolverUsage::Normal,
-            CacheUsage::NonRecursive,
-            AuthUsage::Local,
-            OpUsage::Normal,
-            RegistryUsage::Reserved,
-        )
-    }
+    #[test]
+    fn ip6_arpa_loopback() {
+        let loopback = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa";
+        for name in [
+            loopback.to_string(),
+            format!("{loopback}."),
+            loopback.to_ascii_uppercase(),
+            format!("foo.{loopback}."),
+        ] {
+            assert!(
+                is_ip6_arpa_loopback(&Name::from_ascii(&name).unwrap()),
+                "{name}"
+            );
+        }
 
-    /// Restrictions for the .localhost. zone
-    pub fn localhost(name: Name) -> Self {
-        Self::new(
-            name,
-            UserUsage::Loopback,
-            AppUsage::Loopback,
-            ResolverUsage::Loopback,
-            CacheUsage::Loopback,
-            AuthUsage::Loopback,
-            OpUsage::Loopback,
-            RegistryUsage::Reserved,
-        )
-    }
-
-    /// Restrictions for the .local. zone
-    pub fn local(name: Name) -> Self {
-        Self::new(
-            name,
-            UserUsage::LinkLocal,
-            AppUsage::LinkLocal,
-            ResolverUsage::LinkLocal,
-            CacheUsage::Normal,
-            AuthUsage::Local,
-            OpUsage::Normal,
-            RegistryUsage::Reserved,
-        )
-    }
-
-    /// Restrictions for the .invalid. zone
-    pub fn invalid(name: Name) -> Self {
-        Self::new(
-            name,
-            UserUsage::NxDomain,
-            AppUsage::NxDomain,
-            ResolverUsage::NxDomain,
-            CacheUsage::NxDomain,
-            AuthUsage::NxDomain,
-            OpUsage::NxDomain,
-            RegistryUsage::Reserved,
-        )
-    }
-
-    /// Restrictions for the .example. zone
-    pub fn example(name: Name) -> Self {
-        Self::new(
-            name,
-            UserUsage::Normal,
-            AppUsage::Normal,
-            ResolverUsage::Normal,
-            CacheUsage::Normal,
-            AuthUsage::Normal,
-            OpUsage::Normal,
-            RegistryUsage::Reserved,
-        )
-    }
-
-    /// A reference to this zone name
-    pub fn name(&self) -> &Name {
-        &self.name
-    }
-
-    /// Returns the UserUsage of this zone
-    pub fn user(&self) -> UserUsage {
-        self.user
-    }
-
-    /// Returns the AppUsage of this zone
-    pub fn app(&self) -> AppUsage {
-        self.app
-    }
-
-    /// Returns the ResolverUsage of this zone
-    pub fn resolver(&self) -> ResolverUsage {
-        self.resolver
-    }
-
-    /// Returns the CacheUsage of this zone
-    pub fn cache(&self) -> CacheUsage {
-        self.cache
-    }
-
-    /// Returns the AuthUsage of this zone
-    pub fn auth(&self) -> AuthUsage {
-        self.auth
-    }
-
-    /// Returns the OpUsage of this zone
-    pub fn op(&self) -> OpUsage {
-        self.op
-    }
-
-    /// Returns the RegistryUsage of this zone
-    pub fn registry(&self) -> RegistryUsage {
-        self.registry
-    }
-}
-
-/// Constructs a new Default, with all no restrictions
-impl Default for ZoneUsage {
-    fn default() -> Self {
-        Self::new(
-            Name::root(),
-            UserUsage::Normal,
-            AppUsage::Normal,
-            ResolverUsage::Normal,
-            CacheUsage::Normal,
-            AuthUsage::Normal,
-            OpUsage::Normal,
-            RegistryUsage::Normal,
-        )
-    }
-}
-
-impl Deref for ZoneUsage {
-    type Target = Name;
-
-    fn deref(&self) -> &Self::Target {
-        &self.name
+        for name in [
+            ".",
+            "arpa.",
+            "ip6.arpa.",
+            "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.",
+            "2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.",
+            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.example.",
+            "1.127.in-addr.arpa.",
+        ] {
+            assert!(
+                !is_ip6_arpa_loopback(&Name::from_ascii(name).unwrap()),
+                "{name}"
+            );
+        }
     }
 }

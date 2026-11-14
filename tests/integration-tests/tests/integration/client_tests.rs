@@ -1,0 +1,813 @@
+use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(feature = "__dnssec")]
+use std::str::FromStr;
+use std::sync::Arc;
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+use std::sync::Mutex as StdMutex;
+
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+use time::Duration;
+use tokio::net::UdpSocket;
+
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+use hickory_integration::TestClientStream;
+use hickory_integration::example_zone::create_example;
+use hickory_integration::{GOOGLE_V4, TEST3_V4};
+use hickory_net::NetError;
+#[cfg(feature = "__dnssec")]
+use hickory_net::client::DnssecClient;
+use hickory_net::client::{Client, ClientHandle};
+use hickory_net::runtime::TokioRuntimeProvider;
+use hickory_net::tcp::TcpClientStream;
+use hickory_net::udp::UdpClientStream;
+use hickory_net::xfer::{DnsHandle, DnsMultiplexer};
+#[cfg(feature = "__dnssec")]
+use hickory_proto::dnssec::TrustAnchors;
+#[cfg(feature = "__dnssec")]
+use hickory_proto::op::ResponseCode;
+use hickory_proto::op::{DEFAULT_MAX_PAYLOAD_LEN, DnsRequest, Edns, Message, Query};
+use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption, NSIDPayload};
+use hickory_proto::rr::{DNSClass, Name, RData, RecordType, rdata::A};
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+use hickory_proto::rr::{Record, TSigner};
+use hickory_server::Server;
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+use hickory_server::zone_handler::AxfrPolicy;
+use hickory_server::zone_handler::{Catalog, ZoneHandler};
+use test_support::subscribe;
+
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+struct TestClientConnection {
+    catalog: Arc<StdMutex<Catalog>>,
+}
+
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+impl TestClientConnection {
+    fn new(catalog: Catalog) -> Self {
+        Self {
+            catalog: Arc::new(StdMutex::new(catalog)),
+        }
+    }
+
+    async fn to_multiplexer(&self, signer: TSigner) -> DnsMultiplexer<TestClientStream> {
+        let (future, handle) = TestClientStream::new(self.catalog.clone());
+        let client_stream = future.await.expect("failed to connect");
+        DnsMultiplexer::new(client_stream, handle).with_signer(signer)
+    }
+}
+
+async fn udp_client(addr: SocketAddr) -> Client<TokioRuntimeProvider> {
+    let conn = UdpClientStream::builder(addr, TokioRuntimeProvider::default()).build();
+    let (client, driver) = Client::from_sender(conn);
+    tokio::spawn(driver);
+    client
+}
+
+#[cfg(feature = "__dnssec")]
+async fn udp_dnssec_client(addr: SocketAddr) -> DnssecClient {
+    let conn = UdpClientStream::builder(addr, TokioRuntimeProvider::default()).build();
+    let (client, driver) = Client::from_sender(conn);
+    let client = DnssecClient::from_client(client, Arc::new(TrustAnchors::default()));
+    tokio::spawn(driver);
+    client
+}
+
+async fn tcp_client(addr: SocketAddr) -> Client<TokioRuntimeProvider> {
+    let (future, sender) = TcpClientStream::new(addr, None, None, TokioRuntimeProvider::default());
+    let stream = future.await.expect("failed to connect");
+    let multiplexer = DnsMultiplexer::new(stream, sender);
+    let (client, driver) = Client::from_sender(multiplexer);
+    tokio::spawn(driver);
+    client
+}
+
+#[cfg(feature = "__dnssec")]
+async fn tcp_dnssec_client(addr: SocketAddr) -> DnssecClient {
+    let (future, sender) = TcpClientStream::new(addr, None, None, TokioRuntimeProvider::default());
+    let stream = future.await.expect("failed to connect");
+    let multiplexer = DnsMultiplexer::new(stream, sender);
+    let (client, driver) = Client::from_sender(multiplexer);
+    let client = DnssecClient::from_client(client, Arc::new(TrustAnchors::default()));
+    tokio::spawn(driver);
+    client
+}
+
+/// Returns a client for a local catalog-backed server, so client tests do not depend on public DNS.
+///
+/// The server must be kept alive for as long as the client is in use.
+async fn test_client() -> (Client<TokioRuntimeProvider>, Server<Catalog>) {
+    let handler = create_example();
+    let mut catalog = Catalog::new();
+    catalog.upsert(handler.origin().clone(), vec![Arc::new(handler)]);
+
+    let nsid = NSIDPayload::new(vec![0xC0, 0xFF, 0xEE]).unwrap();
+    let mut server = Server::with_access(catalog, [], [], DEFAULT_MAX_PAYLOAD_LEN, Some(nsid));
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    server.register_socket(socket, DEFAULT_MAX_PAYLOAD_LEN);
+
+    (udp_client(addr).await, server)
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_query_udp() {
+    subscribe();
+    let client = udp_client(GOOGLE_V4).await;
+    test_query(client).await;
+}
+
+#[tokio::test]
+async fn test_query_edns() {
+    // Exercise EDNS request/response handling against the local test server.
+    subscribe();
+    let (client, _server) = test_client().await;
+    test_query_edns_response(client).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_query_tcp() {
+    subscribe();
+    let client = tcp_client(GOOGLE_V4).await;
+    test_query(client).await;
+}
+
+async fn test_query(mut client: Client<TokioRuntimeProvider>) {
+    let name = Name::from_ascii("WWW.example.com").unwrap();
+
+    let response = client
+        .query(name.clone(), DNSClass::IN, RecordType::A)
+        .await
+        .expect("query failed");
+
+    println!("response records: {response:?}");
+    assert!(
+        response
+            .queries
+            .first()
+            .expect("expected query")
+            .name
+            .eq_case(&name)
+    );
+
+    let record = &response.answers[0];
+    assert_eq!(record.name, name);
+    assert_eq!(record.record_type(), RecordType::A);
+    assert_eq!(record.dns_class, DNSClass::IN);
+
+    if let RData::A(address) = record.data {
+        assert_eq!(address, A::new(93, 184, 215, 14))
+    } else {
+        panic!();
+    }
+}
+
+async fn test_query_edns_response(client: Client<TokioRuntimeProvider>) {
+    // Send a query with an EDNS OPT record and verify the local response preserves EDNS.
+
+    let name = Name::from_ascii("WWW.example.com.").unwrap();
+    let mut edns = Edns::new();
+    // TODO: write builder
+    let mut msg = Message::query();
+    msg.metadata.recursion_desired = true;
+    msg.add_query(Query::new(name.clone(), RecordType::A));
+
+    edns.set_max_payload(1232).set_version(0);
+    edns.options_mut()
+        .insert(EdnsOption::NSID(NSIDPayload::new([]).unwrap()));
+    msg.edns = Some(edns);
+
+    let response = client
+        .send(DnsRequest::from(msg))
+        .await
+        .expect("Query failed");
+
+    println!("response records: {response:?}");
+    assert!(
+        response
+            .queries
+            .first()
+            .expect("expected query")
+            .name
+            .eq_case(&name)
+    );
+
+    let record = &response.answers[0];
+    assert_eq!(record.name, name);
+    assert_eq!(record.record_type(), RecordType::A);
+    assert_eq!(record.dns_class, DNSClass::IN);
+
+    if let RData::A(address) = record.data {
+        assert_eq!(address, A::new(93, 184, 215, 14));
+    } else {
+        panic!();
+    }
+
+    let edns = response.edns.as_ref().expect("expected EDNS response");
+    assert_eq!(edns.version(), 0);
+    assert_eq!(edns.max_payload(), 1232);
+    assert_eq!(
+        edns.option(EdnsCode::NSID),
+        Some(&EdnsOption::NSID(
+            NSIDPayload::new(vec![0xC0, 0xFF, 0xEE]).unwrap()
+        ))
+    );
+}
+
+#[tokio::test]
+#[ignore = "flaky test against internet server"]
+#[cfg(feature = "__dnssec")]
+async fn test_secure_query_example_udp() {
+    subscribe();
+    let client = udp_dnssec_client(GOOGLE_V4).await;
+    test_secure_query_example(client).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "__dnssec")]
+async fn test_secure_query_example_tcp() {
+    subscribe();
+    let client = tcp_dnssec_client(GOOGLE_V4).await;
+    test_secure_query_example(client).await;
+}
+
+#[cfg(feature = "__dnssec")]
+async fn test_secure_query_example(mut client: DnssecClient) {
+    subscribe();
+
+    let name = Name::from_str("www.example.com.").unwrap();
+
+    let response = client
+        .query(name.clone(), DNSClass::IN, RecordType::A)
+        .await
+        .expect("Query failed");
+
+    println!("response records: {response:?}");
+    assert!(
+        response
+            .edns
+            .as_ref()
+            .expect("edns not here")
+            .flags()
+            .dnssec_ok
+    );
+
+    assert!(!response.answers.is_empty());
+}
+
+async fn test_timeout_query(mut client: Client<TokioRuntimeProvider>) {
+    let name = Name::from_ascii("WWW.example.com").unwrap();
+
+    let response = client.query(name, DNSClass::IN, RecordType::A).await;
+    assert!(response.is_err());
+
+    let err = response.unwrap_err();
+
+    if !matches!(err, NetError::Timeout) {
+        panic!("expected timeout error");
+    }
+}
+
+#[tokio::test]
+async fn test_timeout_query_udp() {
+    subscribe();
+    let client = udp_client(TEST3_V4).await;
+    test_timeout_query(client).await;
+}
+
+#[tokio::test]
+async fn test_timeout_query_tcp() {
+    subscribe();
+    let (future, sender) = TcpClientStream::new(
+        TEST3_V4,
+        None,
+        Some(std::time::Duration::from_millis(1)),
+        TokioRuntimeProvider::default(),
+    );
+
+    match future.await {
+        Err(NetError::Timeout) => {}
+        Ok(stream) => {
+            let _ =
+                Client::<TokioRuntimeProvider>::from_sender(DnsMultiplexer::new(stream, sender));
+            panic!("expected timeout")
+        }
+        _ => panic!("expected timeout"),
+    }
+}
+
+// // TODO: this test is flaky
+// #[test]
+// #[ignore]
+// #[allow(deprecated)]
+// fn test_dnssec_rollernet_td_udp() {
+//     let c = SyncDnssecClient::new(UdpClientConnection::new("8.8.8.8:53".parse().unwrap()).unwrap())
+//         .build();
+//     c.secure_query(
+//         &Name::parse("rollernet.us.", None).unwrap(),
+//         DNSClass::IN,
+//         RecordType::DS),
+//     ).unwrap();
+// }
+
+// // TODO: this test is flaky
+// #[test]
+// #[ignore]
+// #[allow(deprecated)]
+// fn test_dnssec_rollernet_td_tcp() {
+//     let c = SyncDnssecClient::new(TcpClientConnection::new("8.8.8.8:53".parse().unwrap()).unwrap())
+//         .build();
+//     c.secure_query(
+//         &Name::parse("rollernet.us.", None).unwrap(),
+//         DNSClass::IN,
+//         RecordType::DS),
+//     ).unwrap();
+// }
+
+// // TODO: this test is flaky
+// #[test]
+// #[ignore]
+// #[allow(deprecated)]
+// fn test_dnssec_rollernet_td_tcp_mixed_case() {
+//     let c = SyncDnssecClient::new(TcpClientConnection::new("8.8.8.8:53".parse().unwrap()).unwrap())
+//         .build();
+//     c.secure_query(
+//         &Name::parse("RollErnet.Us.", None).unwrap(),
+//         DNSClass::IN,
+//         RecordType::DS),
+//     ).unwrap();
+// }
+
+#[tokio::test]
+#[ignore = "flaky test against internet server"]
+#[cfg(feature = "__dnssec")]
+async fn test_nsec_query_example_udp() {
+    subscribe();
+    let client = udp_dnssec_client(GOOGLE_V4).await;
+    test_nsec_query_example(client).await;
+}
+
+#[tokio::test]
+#[ignore = "flaky test against internet server"]
+#[cfg(feature = "__dnssec")]
+async fn test_nsec_query_example_tcp() {
+    subscribe();
+    let client = tcp_dnssec_client(GOOGLE_V4).await;
+    test_nsec_query_example(client).await;
+}
+
+#[cfg(feature = "__dnssec")]
+async fn test_nsec_query_example(mut client: DnssecClient) {
+    let name = Name::from_str("none.example.com").unwrap();
+
+    let response = client
+        .query(name, DNSClass::IN, RecordType::A)
+        .await
+        .expect("Query failed");
+
+    assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+}
+
+#[tokio::test]
+#[ignore = "flaky test against internet server"]
+#[cfg(feature = "__dnssec")]
+async fn test_nsec_query_type() {
+    subscribe();
+
+    let mut client = tcp_dnssec_client(GOOGLE_V4).await;
+
+    let name = Name::from_str("www.example.com").unwrap();
+    let response = client
+        .query(name, DNSClass::IN, RecordType::NS)
+        .await
+        .expect("Query failed");
+
+    // TODO: it would be nice to verify that the NSEC records were validated...
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(response.answers.is_empty());
+}
+
+// NSEC3 tests
+#[tokio::test]
+#[cfg(feature = "__dnssec")]
+async fn test_nsec3_nxdomain() {
+    subscribe();
+
+    let name = Name::from_labels(vec!["a", "b", "c", "iana", "org"]).unwrap();
+
+    let mut client = tcp_dnssec_client(GOOGLE_V4).await;
+    let response = client
+        .query(name, DNSClass::IN, RecordType::NS)
+        .await
+        .expect("Query failed");
+
+    assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+}
+
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+async fn create_tsig_ready_client(mut catalog: Catalog) -> (Client<TokioRuntimeProvider>, Name) {
+    use hickory_proto::rr::TSigner;
+    use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
+    use hickory_server::store::sqlite::SqliteZoneHandler;
+
+    let handler = create_example();
+    let mut handler =
+        SqliteZoneHandler::<TokioRuntimeProvider>::new(handler, AxfrPolicy::Deny, true, false);
+    handler.set_allow_update(true);
+    let origin = handler.origin().clone();
+
+    let secret_key = b"test_secret_key_for_client_tests".to_vec();
+    let signer = TSigner::new(
+        secret_key,
+        TsigAlgorithm::HmacSha256,
+        Name::from_str("trusted.example.com.").unwrap(),
+        300,
+    )
+    .unwrap();
+
+    handler.set_tsig_signers(vec![signer.clone()]);
+
+    catalog.upsert(handler.origin().clone(), vec![Arc::new(handler)]);
+    let multiplexer = TestClientConnection::new(catalog)
+        .to_multiplexer(signer)
+        .await;
+    let (client, driver) = Client::from_sender(multiplexer);
+    tokio::spawn(driver);
+
+    (client, origin.into())
+}
+
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+#[tokio::test]
+async fn test_create() {
+    subscribe();
+    let catalog = Catalog::new();
+    let (mut client, origin) = create_tsig_ready_client(catalog).await;
+
+    // create a record
+    let mut record = Record::from_rdata(
+        Name::from_str("new.example.com.").unwrap(),
+        Duration::minutes(5).whole_seconds() as u32,
+        RData::A(A::new(100, 10, 100, 10)),
+    );
+
+    let result = client
+        .create(record.clone(), origin.clone())
+        .await
+        .expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    let result = client
+        .query(record.name.clone(), record.dns_class, record.record_type())
+        .await
+        .expect("query failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.answers.len(), 1);
+    assert_eq!(result.answers[0], record);
+
+    // trying to create again should error
+    // TODO: it would be cool to make this
+    let result = client
+        .create(record.clone(), origin.clone())
+        .await
+        .expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::YXRRSet);
+
+    // will fail if already set and not the same value.
+    record.data = RData::A(A::new(101, 11, 101, 11));
+    let result = client.create(record, origin).await.expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::YXRRSet);
+}
+
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+#[tokio::test]
+async fn test_append() {
+    subscribe();
+    let catalog = Catalog::new();
+    let (mut client, origin) = create_tsig_ready_client(catalog).await;
+
+    // append a record
+    let mut record = Record::from_rdata(
+        Name::from_str("new.example.com.").unwrap(),
+        Duration::minutes(5).whole_seconds() as u32,
+        RData::A(A::new(100, 10, 100, 10)),
+    );
+
+    // first check the must_exist option
+    let result = client
+        .append(record.clone(), origin.clone(), true)
+        .await
+        .expect("append failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NXRRSet);
+
+    // next append to a non-existent RRset
+    let result = client
+        .append(record.clone(), origin.clone(), false)
+        .await
+        .expect("append failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    // verify record contents
+    let result = client
+        .query(record.name.clone(), record.dns_class, record.record_type())
+        .await
+        .expect("query failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.answers.len(), 1);
+    assert_eq!(result.answers[0], record);
+
+    // will fail if already set and not the same value.
+    record.data = RData::A(A::new(101, 11, 101, 11));
+
+    let result = client
+        .append(record.clone(), origin.clone(), true)
+        .await
+        .expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    let result = client
+        .query(record.name.clone(), record.dns_class, record.record_type())
+        .await
+        .expect("query failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.answers.len(), 2);
+
+    assert!(
+        result
+            .answers
+            .iter()
+            .any(|rr| if let RData::A(ip) = rr.data {
+                ip == A::new(100, 10, 100, 10)
+            } else {
+                false
+            })
+    );
+    assert!(
+        result
+            .answers
+            .iter()
+            .any(|rr| if let RData::A(ip) = rr.data {
+                ip == A::new(101, 11, 101, 11)
+            } else {
+                false
+            })
+    );
+
+    // show that appending the same thing again is ok, but doesn't add any records
+    let result = client
+        .append(record.clone(), origin, true)
+        .await
+        .expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    let result = client
+        .query(record.name.clone(), record.dns_class, record.record_type())
+        .await
+        .expect("query failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.answers.len(), 2);
+}
+
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+#[tokio::test]
+async fn test_compare_and_swap() {
+    subscribe();
+    let catalog = Catalog::new();
+    let (mut client, origin) = create_tsig_ready_client(catalog).await;
+
+    // create a record
+    let record = Record::from_rdata(
+        Name::from_str("new.example.com.").unwrap(),
+        Duration::minutes(5).whole_seconds() as u32,
+        RData::A(A::new(100, 10, 100, 10)),
+    );
+
+    let result = client
+        .create(record.clone(), origin.clone())
+        .await
+        .expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    let current = record;
+    let mut new = current.clone();
+    new.data = RData::A(A::new(101, 11, 101, 11));
+
+    let result = client
+        .compare_and_swap(current.clone(), new.clone(), origin.clone())
+        .await
+        .expect("compare_and_swap failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    let result = client
+        .query(new.name.clone(), new.dns_class, new.record_type())
+        .await
+        .expect("query failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.answers.len(), 1);
+    assert!(
+        result
+            .answers
+            .iter()
+            .any(|rr| if let RData::A(ip) = rr.data {
+                ip == A::new(101, 11, 101, 11)
+            } else {
+                false
+            })
+    );
+
+    // check the it fails if tried again.
+    new.data = RData::A(A::new(102, 12, 102, 12));
+
+    let result = client
+        .compare_and_swap(current, new.clone(), origin)
+        .await
+        .expect("compare_and_swap failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NXRRSet);
+
+    let result = client
+        .query(new.name.clone(), new.dns_class, new.record_type())
+        .await
+        .expect("query failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.answers.len(), 1);
+    assert!(
+        result
+            .answers
+            .iter()
+            .any(|rr| if let RData::A(ip) = rr.data {
+                ip == A::new(101, 11, 101, 11)
+            } else {
+                false
+            })
+    );
+}
+
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+#[tokio::test]
+async fn test_delete_by_rdata() {
+    subscribe();
+    let catalog = Catalog::new();
+    let (mut client, origin) = create_tsig_ready_client(catalog).await;
+
+    // append a record
+    let mut record = Record::from_rdata(
+        Name::from_str("new.example.com.").unwrap(),
+        Duration::minutes(5).whole_seconds() as u32,
+        RData::A(A::new(100, 10, 100, 10)),
+    );
+
+    // first check the must_exist option
+    let result = client
+        .delete_by_rdata(record.clone(), origin.clone())
+        .await
+        .expect("delete failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    // next create to a non-existent RRset
+    let result = client
+        .create(record.clone(), origin.clone())
+        .await
+        .expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    record.data = RData::A(A::new(101, 11, 101, 11));
+    let result = client
+        .append(record.clone(), origin.clone(), true)
+        .await
+        .expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    // verify record contents
+    let result = client
+        .delete_by_rdata(record.clone(), origin)
+        .await
+        .expect("delete failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    let result = client
+        .query(record.name.clone(), record.dns_class, record.record_type())
+        .await
+        .expect("query failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.answers.len(), 1);
+    assert!(
+        result
+            .answers
+            .iter()
+            .any(|rr| if let RData::A(ip) = rr.data {
+                ip == A::new(100, 10, 100, 10)
+            } else {
+                false
+            })
+    );
+}
+
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+#[tokio::test]
+async fn test_delete_rrset() {
+    subscribe();
+    let catalog = Catalog::new();
+    let (mut client, origin) = create_tsig_ready_client(catalog).await;
+
+    // append a record
+    let mut record = Record::from_rdata(
+        Name::from_str("new.example.com").unwrap(),
+        Duration::minutes(5).whole_seconds() as u32,
+        RData::A(A::new(100, 10, 100, 10)),
+    );
+
+    // first check the must_exist option
+    let result = client
+        .delete_rrset(record.clone(), origin.clone())
+        .await
+        .expect("delete failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    // next create to a non-existent RRset
+    let result = client
+        .create(record.clone(), origin.clone())
+        .await
+        .expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    record.data = RData::A(A::new(101, 11, 101, 11));
+    let result = client
+        .append(record.clone(), origin.clone(), true)
+        .await
+        .expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    // verify record contents
+    let result = client
+        .delete_rrset(record.clone(), origin)
+        .await
+        .expect("delete failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    let result = client
+        .query(record.name.clone(), record.dns_class, record.record_type())
+        .await
+        .expect("query failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(result.answers.len(), 0);
+}
+
+#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
+#[tokio::test]
+async fn test_delete_all() {
+    use hickory_proto::rr::rdata::AAAA;
+
+    subscribe();
+
+    let catalog = Catalog::new();
+    let (mut client, origin) = create_tsig_ready_client(catalog).await;
+
+    // append a record
+    let mut record = Record::from_rdata(
+        Name::from_str("new.example.com").unwrap(),
+        Duration::minutes(5).whole_seconds() as u32,
+        RData::A(A::new(100, 10, 100, 10)),
+    );
+
+    // first check the must_exist option
+    let result = client
+        .delete_all(record.name.clone(), origin.clone(), DNSClass::IN)
+        .await
+        .expect("delete failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    // next create to a non-existent RRset
+    let result = client
+        .create(record.clone(), origin.clone())
+        .await
+        .expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    record.data = RData::AAAA(AAAA::new(1, 2, 3, 4, 5, 6, 7, 8));
+    let result = client
+        .create(record.clone(), origin.clone())
+        .await
+        .expect("create failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    // verify record contents
+    let result = client
+        .delete_all(record.name.clone(), origin, DNSClass::IN)
+        .await
+        .expect("delete failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+
+    let result = client
+        .query(record.name.clone(), record.dns_class, RecordType::A)
+        .await
+        .expect("query failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(result.answers.len(), 0);
+
+    let result = client
+        .query(record.name.clone(), record.dns_class, RecordType::AAAA)
+        .await
+        .expect("query failed");
+    assert_eq!(result.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(result.answers.len(), 0);
+}

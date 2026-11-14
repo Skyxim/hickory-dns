@@ -1,0 +1,526 @@
+use std::{
+    net::*,
+    str::FromStr,
+    sync::{Arc, Mutex as StdMutex},
+};
+
+use hickory_net::{
+    DnsError, NetError,
+    runtime::TokioRuntimeProvider,
+    xfer::{DnsExchange, DnsMultiplexer},
+};
+use hickory_proto::{
+    op::{DnsRequestOptions, DnsResponse, Query},
+    rr::{
+        Name, RData, Record, RecordType,
+        rdata::{A, AAAA},
+    },
+};
+use hickory_resolver::{
+    Hosts, LookupFuture, caching_client::CachingClient, config::LookupIpStrategy, lookup::Lookup,
+    lookup_ip::LookupIpFuture,
+};
+use hickory_server::{
+    store::in_memory::InMemoryZoneHandler,
+    zone_handler::{Catalog, ZoneHandler},
+};
+use test_support::subscribe;
+
+use hickory_integration::{TestClientStream, example_zone::create_example, mock_client::*};
+
+#[tokio::test]
+async fn test_lookup() {
+    subscribe();
+    let handler = create_example();
+    let mut catalog = Catalog::new();
+    catalog.upsert(handler.origin().clone(), vec![Arc::new(handler)]);
+
+    let (future, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
+    let stream = future.await.expect("failed to connect");
+    let dns_conn = DnsMultiplexer::new(stream, sender);
+    let (client, bg) = DnsExchange::<TokioRuntimeProvider>::from_stream(dns_conn);
+    tokio::spawn(bg);
+
+    let lookup = LookupFuture::lookup(
+        vec![Name::from_str("www.example.com.").unwrap()],
+        RecordType::A,
+        DnsRequestOptions::default(),
+        CachingClient::new(0, client, false),
+    );
+    let lookup = lookup.await.unwrap();
+
+    assert_eq!(lookup.answers()[0].data, RData::A(A::new(93, 184, 215, 14)));
+}
+
+#[tokio::test]
+async fn test_lookup_hosts() {
+    subscribe();
+    let handler = create_example();
+    let mut catalog = Catalog::new();
+    catalog.upsert(handler.origin().clone(), vec![Arc::new(handler)]);
+
+    let (future, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
+    let stream = future.await.expect("failed to connect");
+    let dns_conn = DnsMultiplexer::new(stream, sender);
+    let (client, bg) = DnsExchange::<TokioRuntimeProvider>::from_stream(dns_conn);
+    tokio::spawn(bg);
+
+    let mut hosts = Hosts::default();
+    let record = Record::from_rdata(
+        Name::from_str("www.example.com.").unwrap(),
+        86400,
+        RData::AAAA(AAAA::new(0, 0, 0, 0, 0, 0, 0, 1)),
+    );
+    hosts.insert(
+        Name::from_str("www.example.com.").unwrap(),
+        RecordType::AAAA,
+        Lookup::new_with_max_ttl(
+            Query::new(
+                Name::from_str("www.example.com.").unwrap(),
+                RecordType::AAAA,
+            ),
+            [record],
+        ),
+    );
+
+    let lookup = LookupIpFuture::lookup(
+        vec![Name::from_str("www.example.com.").unwrap()],
+        LookupIpStrategy::default(),
+        CachingClient::new(0, client, false),
+        DnsRequestOptions::default(),
+        Arc::new(hosts),
+        None,
+    );
+    let lookup = lookup.await.unwrap();
+
+    assert_eq!(lookup.iter().next().unwrap(), Ipv6Addr::LOCALHOST);
+}
+
+fn create_ip_like_example() -> InMemoryZoneHandler {
+    let mut handler = create_example();
+    handler.upsert_mut(
+        Record::from_rdata(
+            Name::from_str("1.2.3.4.example.com.").unwrap(),
+            86400,
+            RData::A(A::new(198, 51, 100, 35)),
+        ),
+        0,
+    );
+
+    handler
+}
+
+#[tokio::test]
+async fn test_lookup_ipv4_like() {
+    subscribe();
+    let handler = create_ip_like_example();
+    let mut catalog = Catalog::new();
+    catalog.upsert(handler.origin().clone(), vec![Arc::new(handler)]);
+
+    let (future, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
+    let stream = future.await.expect("failed to connect");
+    let dns_conn = DnsMultiplexer::new(stream, sender);
+    let (client, bg) = DnsExchange::<TokioRuntimeProvider>::from_stream(dns_conn);
+    tokio::spawn(bg);
+
+    let lookup = LookupIpFuture::lookup(
+        vec![Name::from_str("1.2.3.4.example.com.").unwrap()],
+        LookupIpStrategy::default(),
+        CachingClient::new(0, client, false),
+        DnsRequestOptions::default(),
+        Arc::new(Hosts::default()),
+        Some(RData::A(A::new(1, 2, 3, 4))),
+    );
+    let lookup = lookup.await.unwrap();
+
+    assert_eq!(
+        lookup.iter().next().unwrap(),
+        Ipv4Addr::new(198, 51, 100, 35)
+    );
+}
+
+#[tokio::test]
+async fn test_lookup_ipv4_like_fall_through() {
+    subscribe();
+    let handler = create_ip_like_example();
+    let mut catalog = Catalog::new();
+    catalog.upsert(handler.origin().clone(), vec![Arc::new(handler)]);
+
+    let (future, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
+    let stream = future.await.expect("failed to connect");
+    let dns_conn = DnsMultiplexer::new(stream, sender);
+    let (client, bg) = DnsExchange::<TokioRuntimeProvider>::from_stream(dns_conn);
+    tokio::spawn(bg);
+
+    let lookup = LookupIpFuture::lookup(
+        vec![Name::from_str("198.51.100.35.example.com.").unwrap()],
+        LookupIpStrategy::default(),
+        CachingClient::new(0, client, false),
+        DnsRequestOptions::default(),
+        Arc::new(Hosts::default()),
+        Some(RData::A(A::new(198, 51, 100, 35))),
+    );
+    let lookup = lookup.await.unwrap();
+
+    assert_eq!(
+        lookup.iter().next().unwrap(),
+        Ipv4Addr::new(198, 51, 100, 35)
+    );
+}
+
+#[tokio::test]
+async fn test_mock_lookup() {
+    subscribe();
+    let resp_query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let v4_record = v4_record(
+        Name::from_str("www.example.com.").unwrap(),
+        Ipv4Addr::new(93, 184, 215, 14),
+    );
+    let message = message(resp_query, vec![v4_record], vec![], vec![]);
+    let client: MockClientHandle<_> =
+        MockClientHandle::mock(vec![Ok(DnsResponse::from_message(message).unwrap())]);
+
+    let lookup = LookupFuture::lookup(
+        vec![Name::from_str("www.example.com.").unwrap()],
+        RecordType::A,
+        DnsRequestOptions::default(),
+        CachingClient::new(0, client, false),
+    );
+
+    let lookup = lookup.await.unwrap();
+    assert_eq!(lookup.answers()[0].data, RData::A(A::new(93, 184, 215, 14)));
+}
+
+#[tokio::test]
+async fn test_cname_lookup() {
+    subscribe();
+    let resp_query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let cname_record = cname_record(
+        Name::from_str("www.example.com.").unwrap(),
+        Name::from_str("v4.example.com.").unwrap(),
+    );
+    let v4_record = v4_record(
+        Name::from_str("v4.example.com.").unwrap(),
+        Ipv4Addr::new(93, 184, 215, 14),
+    );
+    let message = message(resp_query, vec![cname_record, v4_record], vec![], vec![]);
+    let client: MockClientHandle<_> =
+        MockClientHandle::mock(vec![Ok(DnsResponse::from_message(message).unwrap())]);
+
+    let lookup = LookupFuture::lookup(
+        vec![Name::from_str("www.example.com.").unwrap()],
+        RecordType::A,
+        DnsRequestOptions::default(),
+        CachingClient::new(0, client, false),
+    );
+
+    let lookup = lookup.await.unwrap();
+    assert_eq!(lookup.answers()[0].data, RData::A(A::new(93, 184, 215, 14)));
+}
+
+#[tokio::test]
+async fn test_cname_lookup_preserve() {
+    subscribe();
+    let resp_query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let cname_record = cname_record(
+        Name::from_str("www.example.com.").unwrap(),
+        Name::from_str("v4.example.com.").unwrap(),
+    );
+    let v4_record = v4_record(
+        Name::from_str("v4.example.com.").unwrap(),
+        Ipv4Addr::new(93, 184, 215, 14),
+    );
+    let message = message(
+        resp_query,
+        vec![cname_record.clone(), v4_record],
+        vec![],
+        vec![],
+    );
+    let client: MockClientHandle<_> =
+        MockClientHandle::mock(vec![Ok(DnsResponse::from_message(message).unwrap())]);
+
+    let lookup = LookupFuture::lookup(
+        vec![Name::from_str("www.example.com.").unwrap()],
+        RecordType::A,
+        DnsRequestOptions::default(),
+        CachingClient::new(0, client, true),
+    );
+
+    let lookup = lookup.await.unwrap();
+
+    let mut iter = lookup.answers().iter().map(|r| &r.data);
+    assert_eq!(iter.next().unwrap(), &cname_record.data);
+    assert_eq!(iter.next().unwrap(), &RData::A(A::new(93, 184, 215, 14)));
+}
+
+#[tokio::test]
+async fn test_chained_cname_lookup() {
+    subscribe();
+    let cname_record = cname_record(
+        Name::from_str("www.example.com.").unwrap(),
+        Name::from_str("v4.example.com.").unwrap(),
+    );
+    let v4_record = v4_record(
+        Name::from_str("v4.example.com.").unwrap(),
+        Ipv4Addr::new(93, 184, 215, 14),
+    );
+
+    // The first response should be a cname, the second will be the actual record
+    let message1 = message(
+        Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A),
+        vec![cname_record],
+        vec![],
+        vec![],
+    );
+    let message2 = message(
+        Query::new(Name::from_str("v4.example.com.").unwrap(), RecordType::A),
+        vec![v4_record],
+        vec![],
+        vec![],
+    );
+
+    // the mock pops messages...
+    let client: MockClientHandle<_> = MockClientHandle::mock(vec![
+        Ok(DnsResponse::from_message(message2).unwrap()),
+        Ok(DnsResponse::from_message(message1).unwrap()),
+    ]);
+
+    let lookup = LookupFuture::lookup(
+        vec![Name::from_str("www.example.com.").unwrap()],
+        RecordType::A,
+        DnsRequestOptions::default(),
+        CachingClient::new(0, client, false),
+    );
+
+    let lookup = lookup.await.unwrap();
+    assert_eq!(lookup.answers()[0].data, RData::A(A::new(93, 184, 215, 14)));
+}
+
+#[tokio::test]
+async fn test_chained_cname_lookup_preserve() {
+    subscribe();
+    let cname_record = cname_record(
+        Name::from_str("www.example.com.").unwrap(),
+        Name::from_str("v4.example.com.").unwrap(),
+    );
+    let v4_record = v4_record(
+        Name::from_str("v4.example.com.").unwrap(),
+        Ipv4Addr::new(93, 184, 215, 14),
+    );
+
+    // The first response should be a cname, the second will be the actual record
+    let message1 = message(
+        Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A),
+        vec![cname_record.clone()],
+        vec![],
+        vec![],
+    );
+    let message2 = message(
+        Query::new(Name::from_str("v4.example.com.").unwrap(), RecordType::A),
+        vec![v4_record],
+        vec![],
+        vec![],
+    );
+
+    // the mock pops messages...
+    let client: MockClientHandle<_> = MockClientHandle::mock(vec![
+        Ok(DnsResponse::from_message(message2).unwrap()),
+        Ok(DnsResponse::from_message(message1).unwrap()),
+    ]);
+
+    let lookup = LookupFuture::lookup(
+        vec![Name::from_str("www.example.com.").unwrap()],
+        RecordType::A,
+        DnsRequestOptions::default(),
+        CachingClient::new(0, client, true),
+    );
+
+    let lookup = lookup.await.unwrap();
+
+    let mut iter = lookup.answers().iter().map(|r| &r.data);
+    assert_eq!(iter.next().unwrap(), &cname_record.data);
+    assert_eq!(iter.next().unwrap(), &RData::A(A::new(93, 184, 215, 14)));
+}
+
+#[tokio::test]
+async fn test_max_chained_lookup_depth() {
+    subscribe();
+    let www_name = Name::from_str("www.example.com.").unwrap();
+    let cname2_name = Name::from_str("cname2.example.com.").unwrap();
+    let cname3_name = Name::from_str("cname3.example.com.").unwrap();
+    let cname4_name = Name::from_str("cname4.example.com.").unwrap();
+    let cname5_name = Name::from_str("cname5.example.com.").unwrap();
+    let cname6_name = Name::from_str("cname6.example.com.").unwrap();
+    let cname7_name = Name::from_str("cname7.example.com.").unwrap();
+    let cname8_name = Name::from_str("cname8.example.com.").unwrap();
+    let cname9_name = Name::from_str("cname9.example.com.").unwrap();
+    let v4_name = Name::from_str("v4.example.com.").unwrap();
+    let message1 = message(
+        Query::new(www_name.clone(), RecordType::A),
+        vec![cname_record(www_name.clone(), cname2_name.clone())],
+        vec![],
+        vec![],
+    );
+    let message2 = message(
+        Query::new(cname2_name.clone(), RecordType::A),
+        vec![cname_record(cname2_name, cname3_name.clone())],
+        vec![],
+        vec![],
+    );
+    let message3 = message(
+        Query::new(cname3_name.clone(), RecordType::A),
+        vec![cname_record(cname3_name, cname4_name.clone())],
+        vec![],
+        vec![],
+    );
+    let message4 = message(
+        Query::new(cname4_name.clone(), RecordType::A),
+        vec![cname_record(cname4_name, cname5_name.clone())],
+        vec![],
+        vec![],
+    );
+    let message5 = message(
+        Query::new(cname5_name.clone(), RecordType::A),
+        vec![cname_record(cname5_name, cname6_name.clone())],
+        vec![],
+        vec![],
+    );
+    let message6 = message(
+        Query::new(cname6_name.clone(), RecordType::A),
+        vec![cname_record(cname6_name, cname7_name.clone())],
+        vec![],
+        vec![],
+    );
+    let message7 = message(
+        Query::new(cname7_name.clone(), RecordType::A),
+        vec![cname_record(cname7_name, cname8_name.clone())],
+        vec![],
+        vec![],
+    );
+    let message8 = message(
+        Query::new(cname8_name.clone(), RecordType::A),
+        vec![cname_record(cname8_name, cname9_name.clone())],
+        vec![],
+        vec![],
+    );
+    let message9 = message(
+        Query::new(cname9_name.clone(), RecordType::A),
+        vec![cname_record(cname9_name, v4_name.clone())],
+        vec![],
+        vec![],
+    );
+    let message10 = message(
+        Query::new(v4_name.clone(), RecordType::A),
+        vec![v4_record(v4_name, Ipv4Addr::new(93, 184, 215, 14))],
+        vec![],
+        vec![],
+    );
+
+    // The mock pops messages in reverse order.
+    let client: MockClientHandle<_> = MockClientHandle::mock(vec![
+        Ok(DnsResponse::from_message(message10).unwrap()),
+        Ok(DnsResponse::from_message(message9).unwrap()),
+        Ok(DnsResponse::from_message(message8).unwrap()),
+        Ok(DnsResponse::from_message(message7).unwrap()),
+        Ok(DnsResponse::from_message(message6).unwrap()),
+        Ok(DnsResponse::from_message(message5).unwrap()),
+        Ok(DnsResponse::from_message(message4).unwrap()),
+        Ok(DnsResponse::from_message(message3).unwrap()),
+        Ok(DnsResponse::from_message(message2).unwrap()),
+        Ok(DnsResponse::from_message(message1).unwrap()),
+    ]);
+
+    let client = CachingClient::new(0, client, false);
+    let lookup = LookupFuture::lookup(
+        vec![Name::from_str("www.example.com.").unwrap()],
+        RecordType::A,
+        DnsRequestOptions::default(),
+        client.clone(),
+    );
+
+    println!("performing max cname validation");
+    assert!(lookup.await.is_err());
+
+    // This query should succeed, as the queue depth should reset to 0 on a failed request
+    let lookup = LookupFuture::lookup(
+        vec![Name::from_str("cname9.example.com.").unwrap()],
+        RecordType::A,
+        DnsRequestOptions::default(),
+        client,
+    );
+
+    println!("performing followup resolve, should work");
+    let lookup = lookup.await.unwrap();
+    assert_eq!(lookup.answers()[0].data, RData::A(A::new(93, 184, 215, 14)));
+}
+
+// This test expects a no-answer query which returns a SOA record in the nameservers section to
+// contain a NetErrorKind::NoRecordsFound error with a SOA record present (soa.is_some()) and
+// no NS records present (!ns.is_some())
+#[tokio::test]
+async fn test_forward_soa() {
+    subscribe();
+    let resp_query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::NS);
+    let soa_record = soa_record(
+        Name::from_str("www.example.com").unwrap(),
+        Name::from_str("ns1.example.com").unwrap(),
+    );
+    let message = message(resp_query.clone(), vec![], vec![soa_record], vec![]);
+
+    let client: MockClientHandle<_> =
+        MockClientHandle::mock(vec![Ok(DnsResponse::from_message(message).unwrap())]);
+
+    let client = CachingClient::new(0, client, false);
+    let lookup = LookupFuture::lookup(
+        vec![Name::from_str("www.example.com.").unwrap()],
+        RecordType::NS,
+        DnsRequestOptions::default(),
+        client.clone(),
+    );
+
+    let lookup = lookup.await;
+    let Err(e) = lookup else {
+        panic!("Expected Error type for {lookup:?}");
+    };
+
+    let NetError::Dns(DnsError::NoRecordsFound(no_records)) = e else {
+        panic!("unexpected error: {e:?}");
+    };
+
+    assert!(no_records.soa.is_some());
+    assert!(no_records.ns.is_none());
+}
+
+// This test expects a no-answer query which returns an NS record in the nameservers section to
+// contain a NetErrorKind::NoRecordsFound error with an NS record present (ns.is_some()) and
+// no SOA records present (!soa.is_some())
+#[tokio::test]
+async fn test_forward_ns() {
+    subscribe();
+    let resp_query = Query::new(Name::from_str("example.com.").unwrap(), RecordType::A);
+    let ns1 = ns_record(Name::default(), Name::from_str("ns1.example.com").unwrap());
+    let message = message(resp_query.clone(), vec![], vec![ns1], vec![]);
+
+    let client: MockClientHandle<_> =
+        MockClientHandle::mock(vec![Ok(DnsResponse::from_message(message).unwrap())]);
+
+    let client = CachingClient::new(0, client, false);
+    let lookup = LookupFuture::lookup(
+        vec![Name::from_str("example.com.").unwrap()],
+        RecordType::A,
+        DnsRequestOptions::default(),
+        client.clone(),
+    );
+
+    let lookup = lookup.await;
+    let Err(e) = lookup else {
+        panic!("Expected Error type for {lookup:?}");
+    };
+
+    let NetError::Dns(DnsError::NoRecordsFound(no_records)) = e else {
+        panic!("unexpected error: {e:?}");
+    };
+
+    assert!(no_records.soa.is_none());
+    assert!(no_records.ns.is_some());
+}

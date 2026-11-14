@@ -7,19 +7,6 @@
 
 //! The resolve program
 
-// BINARY WARNINGS
-#![warn(
-    clippy::default_trait_access,
-    clippy::dbg_macro,
-    clippy::unimplemented,
-    missing_copy_implementations,
-    missing_docs,
-    non_snake_case,
-    non_upper_case_globals,
-    rust_2018_idioms,
-    unreachable_pub
-)]
-
 use std::{
     fs::File,
     io::{BufRead, BufReader},
@@ -32,18 +19,18 @@ use std::{
 
 use clap::{ArgGroup, Parser};
 use console::style;
-use hickory_proto::error::{ProtoError, ProtoErrorKind};
 use tokio::task::JoinSet;
-
-use hickory_client::rr::{Record, RecordData};
-use hickory_resolver::{
-    config::{NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts},
-    error::ResolveError,
-    lookup::Lookup,
-    proto::rr::RecordType,
-    TokioAsyncResolver,
-};
 use tokio::time::MissedTickBehavior;
+
+use hickory_net::{DnsError, NetError, runtime::TokioRuntimeProvider};
+use hickory_proto::rr::{Record, RecordData, RecordType};
+use hickory_resolver::{
+    TokioResolver,
+    config::{
+        CLOUDFLARE, GOOGLE, NameServerConfig, ProtocolConfig, QUAD9, ResolverConfig, ResolverOpts,
+    },
+    lookup::Lookup,
+};
 
 /// A CLI interface for the hickory-resolver.
 ///
@@ -125,21 +112,9 @@ struct Opts {
     #[clap(long)]
     tcp: bool,
 
-    /// Enable debug and all logging
-    #[clap(long)]
-    debug: bool,
-
-    /// Enable info + warning + error logging
-    #[clap(long)]
-    info: bool,
-
-    /// Enable warning + error logging
-    #[clap(long)]
-    warn: bool,
-
-    /// Enable error logging
-    #[clap(long)]
-    error: bool,
+    /// Configure log verbosity.
+    #[clap(flatten)]
+    log_config: hickory_util::LogConfig,
 
     /// Set the time interval between requests (in seconds, useful with --file)
     #[clap(long, default_value = "1.0")]
@@ -147,13 +122,13 @@ struct Opts {
 }
 
 fn print_record<D: RecordData, R: Deref<Target = Record<D>>>(r: &R) {
-    print!(
+    println!(
         "\t{name} {ttl} {class} {ty} {rdata}",
-        name = style(r.name()).blue(),
-        ttl = style(r.ttl()).blue(),
-        class = style(r.dns_class()).blue(),
+        name = style(&r.name).blue(),
+        ttl = style(r.ttl).blue(),
+        class = style(r.dns_class).blue(),
         ty = style(r.record_type()).blue(),
-        rdata = r.data(),
+        rdata = r.data,
     );
 }
 
@@ -164,30 +139,51 @@ fn print_ok(lookup: Lookup) {
         style(lookup.query()).blue()
     );
 
-    for r in lookup.record_iter() {
-        print_record(&r);
+    let message = lookup.message();
+
+    let answers = &message.answers;
+    if !answers.is_empty() {
+        println!("\n;; {} SECTION:", style("ANSWER").yellow());
+        for r in answers {
+            print_record(&r);
+        }
+    }
+
+    let authority = &message.authorities;
+    if !authority.is_empty() {
+        println!("\n;; {} SECTION:", style("AUTHORITY").yellow());
+        for r in authority {
+            print_record(&r);
+        }
+    }
+
+    let additional = &message.additionals;
+    if !additional.is_empty() {
+        println!("\n;; {} SECTION:", style("ADDITIONAL").yellow());
+        for r in additional {
+            print_record(&r);
+        }
     }
 }
 
-fn print_error(error: ResolveError) {
-    match error.proto().map(ProtoError::kind) {
-        Some(ProtoErrorKind::NoRecordsFound { query, soa, .. }) => {
-            println!(
-                "{} for query {}",
-                style("NoRecordsFound").red(),
-                style(query).blue()
-            );
-            if let Some(ref r) = soa {
-                print_record(r);
-            }
-        }
-        _ => {
-            println!("{error:?}");
-        }
+fn print_error(error: NetError) {
+    let NetError::Dns(DnsError::NoRecordsFound(no_records)) = error else {
+        println!("{error:?}");
+        return;
+    };
+
+    println!(
+        "{} for query {}",
+        style("NoRecordsFound").red(),
+        style(&no_records.query).blue()
+    );
+
+    if let Some(r) = &no_records.soa {
+        print_record(r);
     }
 }
 
-fn print_result(result: Result<Lookup, ResolveError>) {
+fn print_result(result: Result<Lookup, NetError>) {
     match result {
         Ok(lookup) => print_ok(lookup),
         Err(re) => print_error(re),
@@ -220,19 +216,19 @@ fn log_query(name: &str, ty: RecordType, name_servers: &str, opts: &Opts) {
 }
 
 async fn execute_query(
-    resolver: Arc<TokioAsyncResolver>,
+    resolver: Arc<TokioResolver>,
     name: String,
     happy: bool,
     reverse: bool,
     ty: RecordType,
-) -> Result<Lookup, ResolveError> {
+) -> Result<Lookup, NetError> {
     if happy {
         Ok(resolver.lookup_ip(name.to_string()).await?.into())
     } else if reverse {
         let v4addr = name
             .parse::<IpAddr>()
-            .unwrap_or_else(|_| panic!("Could not parse {} into an IP address", name));
-        Ok(resolver.reverse_lookup(v4addr).await?.into())
+            .unwrap_or_else(|_| panic!("Could not parse {name} into an IP address"));
+        Ok(resolver.reverse_lookup(v4addr).await?)
     } else {
         Ok(resolver.lookup(name.to_string(), ty).await?)
     }
@@ -244,19 +240,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts: Opts = Opts::parse();
 
     // enable logging early
-    let log_level = if opts.debug {
-        Some(tracing::Level::DEBUG)
-    } else if opts.info {
-        Some(tracing::Level::INFO)
-    } else if opts.warn {
-        Some(tracing::Level::WARN)
-    } else if opts.error {
-        Some(tracing::Level::ERROR)
-    } else {
-        None
-    };
-
-    hickory_util::logger(env!("CARGO_BIN_NAME"), log_level);
+    hickory_util::logger(env!("CARGO_BIN_NAME"), opts.log_config.level());
 
     // read system configuration
     let (sys_config, sys_options): (Option<ResolverConfig>, Option<ResolverOpts>) = if opts.system {
@@ -268,41 +252,29 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Configure all the name servers
-    let mut name_servers = NameServerConfigGroup::new();
-
+    let mut name_servers = Vec::new();
     for socket_addr in &opts.nameserver {
-        name_servers.push(NameServerConfig {
-            socket_addr: *socket_addr,
-            protocol: Protocol::Tcp,
-            tls_dns_name: None,
-            trust_negative_responses: false,
-            #[cfg(feature = "dns-over-rustls")]
-            tls_config: None,
-            bind_addr: opts.bind.map(|ip| SocketAddr::new(ip, 0)),
-        });
+        let mut config = NameServerConfig::udp_and_tcp(socket_addr.ip());
+        config.trust_negative_responses = false;
+        for conn in config.connections.iter_mut() {
+            conn.port = socket_addr.port();
+            conn.bind_addr = opts.bind.map(|ip| SocketAddr::new(ip, 0));
+        }
 
-        name_servers.push(NameServerConfig {
-            socket_addr: *socket_addr,
-            protocol: Protocol::Udp,
-            tls_dns_name: None,
-            trust_negative_responses: false,
-            #[cfg(feature = "dns-over-rustls")]
-            tls_config: None,
-            bind_addr: opts.bind.map(|ip| SocketAddr::new(ip, 0)),
-        });
+        name_servers.push(config);
     }
 
     if opts.google {
-        name_servers.merge(NameServerConfigGroup::google());
+        name_servers.extend(GOOGLE.udp_and_tcp());
     }
     if opts.cloudflare {
-        name_servers.merge(NameServerConfigGroup::cloudflare());
+        name_servers.extend(CLOUDFLARE.udp_and_tcp());
     }
     if opts.quad9 {
-        name_servers.merge(NameServerConfigGroup::quad9());
+        name_servers.extend(QUAD9.udp_and_tcp());
     }
     if name_servers.is_empty() && sys_config.is_none() {
-        name_servers.merge(NameServerConfigGroup::google());
+        name_servers.extend(GOOGLE.udp_and_tcp());
     }
 
     let ipv4 = opts.ipv4 || !opts.ipv6;
@@ -311,13 +283,15 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let udp = opts.udp || !opts.tcp;
     let tcp = opts.tcp || !opts.udp;
 
-    name_servers
-        .retain(|ns| (ipv4 && ns.socket_addr.is_ipv4()) || (ipv6 && ns.socket_addr.is_ipv6()));
-    name_servers.retain(|ns| {
-        (udp && ns.protocol == Protocol::Udp) || (tcp && ns.protocol == Protocol::Tcp)
-    });
+    name_servers.retain(|ns| (ipv4 && ns.ip.is_ipv4()) || (ipv6 && ns.ip.is_ipv6()));
+    for ns in name_servers.iter_mut() {
+        ns.connections.retain(|conn| {
+            (udp && conn.protocol == ProtocolConfig::Udp)
+                || (tcp && conn.protocol == ProtocolConfig::Tcp)
+        });
+    }
 
-    let mut config = sys_config.unwrap_or_else(ResolverConfig::new);
+    let mut config = sys_config.unwrap_or_else(|| ResolverConfig::from_name_servers(vec![]));
 
     for ns in name_servers.iter() {
         config.add_name_server(ns.clone());
@@ -326,7 +300,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let name_servers = config
         .name_servers()
         .iter()
-        .map(|ns| format!("{ns}"))
+        .map(|ns| format!("{ns:#?}"))
         .collect::<Vec<String>>()
         .join(", ");
 
@@ -336,7 +310,10 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
     }
 
-    let resolver_arc = Arc::new(TokioAsyncResolver::tokio(config, options));
+    let mut resolver_builder =
+        TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+    *resolver_builder.options_mut() = options;
+    let resolver_arc = Arc::new(resolver_builder.build()?);
 
     if let Some(domainname) = &opts.domainname {
         log_query(domainname, opts.ty, &name_servers, &opts);

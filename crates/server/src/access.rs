@@ -18,28 +18,28 @@ pub(crate) struct AccessControl {
 
 impl AccessControl {
     /// Insert a new network that is denied access to the server
-    pub(crate) fn insert_deny(&mut self, networks: &[IpNet]) {
+    pub(crate) fn insert_deny(&mut self, networks: impl IntoIterator<Item = IpNet>) {
         for network in networks {
             match network {
                 IpNet::V4(v4) => {
-                    self.ipv4.deny.insert(*v4);
+                    self.ipv4.deny.insert(v4);
                 }
                 IpNet::V6(v6) => {
-                    self.ipv6.deny.insert(*v6);
+                    self.ipv6.deny.insert(v6);
                 }
             }
         }
     }
 
     /// Insert a new network that is allowed access to the server
-    pub(crate) fn insert_allow(&mut self, networks: &[IpNet]) {
+    pub(crate) fn insert_allow(&mut self, networks: impl IntoIterator<Item = IpNet>) {
         for network in networks {
             match network {
                 IpNet::V4(v4) => {
-                    self.ipv4.allow.insert(*v4);
+                    self.ipv4.allow.insert(v4);
                 }
                 IpNet::V6(v6) => {
-                    self.ipv6.allow.insert(*v6);
+                    self.ipv6.allow.insert(v6);
                 }
             }
         }
@@ -56,7 +56,7 @@ impl AccessControl {
     /// Ok if access is granted, Err otherwise
     #[must_use]
     pub(crate) fn allow(&self, ip: IpAddr) -> bool {
-        match ip {
+        match ip.to_canonical() {
             IpAddr::V4(v4) => {
                 let v4 = Ipv4Net::from(v4);
 
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn test_v4() {
         let mut access = AccessControl::default();
-        access.insert_allow(&["192.168.1.0/24".parse().unwrap()]);
+        access.insert_allow(["192.168.1.0/24".parse().unwrap()]);
 
         assert!(access.allow("192.168.1.1".parse().unwrap()));
         assert!(access.allow("192.168.1.255".parse().unwrap()));
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn test_v6() {
         let mut access = AccessControl::default();
-        access.insert_allow(&["fd00::/120".parse().unwrap()]);
+        access.insert_allow(["fd00::/120".parse().unwrap()]);
 
         assert!(access.allow("fd00::1".parse().unwrap()));
         assert!(access.allow("fd00::00ff".parse().unwrap()));
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn test_deny_v4() {
         let mut access = AccessControl::default();
-        access.insert_deny(&["192.168.1.0/24".parse().unwrap()]);
+        access.insert_deny(["192.168.1.0/24".parse().unwrap()]);
 
         assert!(!access.allow("192.168.1.1".parse().unwrap()));
         assert!(!access.allow("192.168.1.255".parse().unwrap()));
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn test_deny_v6() {
         let mut access = AccessControl::default();
-        access.insert_deny(&["fd00::/120".parse().unwrap()]);
+        access.insert_deny(["fd00::/120".parse().unwrap()]);
 
         assert!(!access.allow("fd00::1".parse().unwrap()));
         assert!(!access.allow("fd00::00ff".parse().unwrap()));
@@ -170,8 +170,8 @@ mod tests {
     #[test]
     fn test_deny_allow_v4() {
         let mut access = AccessControl::default();
-        access.insert_deny(&["192.168.0.0/16".parse().unwrap()]);
-        access.insert_allow(&["192.168.1.0/24".parse().unwrap()]);
+        access.insert_deny(["192.168.0.0/16".parse().unwrap()]);
+        access.insert_allow(["192.168.1.0/24".parse().unwrap()]);
 
         assert!(access.allow("192.168.1.1".parse().unwrap()));
         assert!(access.allow("192.168.1.255".parse().unwrap()));
@@ -180,5 +180,39 @@ mod tests {
 
         // but all other networks should be allowed
         assert!(access.allow("10.0.0.1".parse().unwrap()));
+    }
+
+    // A dual-stack listener delivers a v4 client as `::ffff:a.b.c.d`. That
+    // source must still hit the v4 deny prefix the operator configured.
+    #[test]
+    fn test_v4_mapped_v6_matches_v4_deny() {
+        let mut access = AccessControl::default();
+        access.insert_deny(["192.168.0.0/16".parse().unwrap()]);
+        access.insert_deny(["10.0.0.0/8".parse().unwrap()]);
+
+        assert!(!access.allow("192.168.1.1".parse().unwrap()));
+        assert!(!access.allow("10.2.3.4".parse().unwrap()));
+
+        assert!(!access.allow("::ffff:192.168.1.1".parse().unwrap()));
+        assert!(!access.allow("::ffff:10.2.3.4".parse().unwrap()));
+
+        assert!(access.allow("8.8.8.8".parse().unwrap()));
+        assert!(access.allow("::ffff:8.8.8.8".parse().unwrap()));
+        assert!(access.allow("2001:db8::1".parse().unwrap()));
+    }
+
+    // Allow-list overrides must follow the same canonicalisation so a v4
+    // exception applies to the matching `::ffff:` source too.
+    #[test]
+    fn test_v4_mapped_v6_honours_v4_allow_override() {
+        let mut access = AccessControl::default();
+        access.insert_deny(["10.0.0.0/8".parse().unwrap()]);
+        access.insert_allow(["10.1.2.3/32".parse().unwrap()]);
+
+        assert!(!access.allow("10.2.3.4".parse().unwrap()));
+        assert!(access.allow("10.1.2.3".parse().unwrap()));
+
+        assert!(!access.allow("::ffff:10.2.3.4".parse().unwrap()));
+        assert!(access.allow("::ffff:10.1.2.3".parse().unwrap()));
     }
 }

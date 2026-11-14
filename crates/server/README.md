@@ -1,33 +1,77 @@
 # Overview
 
-Hickory DNS Server is a library which implements the zone authoritory functionality.
+`hickory-server` is a library for integrating safe and secure DNS servers into
+an async Tokio application. It supports a variety of protocol features
+(DNSSEC, TSIG, SIG(0), DoT, DoQ, DoH). Servers can be operated in an authoritative
+role, or as a forwarding resolver, stub resolver, or a recursive resolver
+(experimental).
 
-This library contains basic implementations for DNS zone hosting. It is capable of performing signing all records in the zone for server DNSSEC RRSIG records associated with all records in a zone. There is also a `hickory-dns` binary that can be generated from the library with `cargo install hickory-dns`. Dynamic updates are supported via `SIG0` (an mTLS authentication method is under development).
+See the [`hickory-dns`] binary crate for a complete application built using
+`hickory-server`.
 
-**NOTICE** This project was rebranded from Trust-DNS to Hickory DNS and has been moved to the https://github.com/hickory-dns/hickory-dns organization and repo, this crate/binary has been moved to [hickory-server](https://crates.io/crates/hickory-server), from `0.24` and onward, for prior versions see [trust-dns-server](https://crates.io/crates/trust-dns-server).
+[`hickory-dns`]: ../../bin/
 
 ## Features
 
-- Dynamic Update with sqlite journaling backend (SIG0)
-- DNSSEC online signing (NSEC not NSEC3)
+- Dynamic Update with sqlite journaling backend (SIG0, TSIG)
+- DNSSEC online signing (NSEC and NSEC3)
 - DNS over TLS (DoT)
+- DNS over QUIC (DoQ)
 - DNS over HTTPS (DoH)
+- DNS over HTTP/3 (DoH3)
 - Forwarding stub resolver
+- Recursive resolver (experimental)
 - ANAME resolution, for zone mapping aliass to A and AAAA records
 - Additionals section generation for aliasing record types
 
-## Future goals
+## Cryptography provider
 
-- Distributed dynamic DNS updates, with consensus
-- mTLS based authorization for Dynamic Updates
-- Online NSEC creation for queries
-- Full hint based resolving
-- Maybe NSEC3 and/or NSEC5 support
+Features requiring cryptography require selecting a specific cryptography
+provider. See the [project README] for more information.
 
-## Minimum Rust Version
+[project README]: ../../README.md#Cryptography-provider
 
-The current minimum rustc version for this project is `1.67`
+## Protocol support
 
-## Versioning
+The following DNS protocols are optionally supported:
 
-Hickory DNS does it's best job to follow semver. Hickory DNS will be promoted to 1.0 upon stabilization of the publicly exposed APIs. This does not mean that Hickory DNS will necessarily break on upgrades between 0.x updates. Whenever possible, old APIs will be deprecated with notes on what replaced those deprecations. Hickory DNS will make a best effort to never break software which depends on it due to API changes, though this can not be guaranteed. Deprecated interfaces will be maintained for at minimum one major release after that in which they were deprecated (where possible), with the exception of the upgrade to 1.0 where all deprecated interfaces will be planned to be removed.
+* DNS over TLS (DoT)
+* DNS over HTTP/2 (DoH)
+* DNS over QUIC (DoQ)
+* DNS over HTTP/3 (DoH3)
+
+In order to use these optional protocols you must enable a cargo feature
+corresponding to your desired cryptography provider:
+
+* DoT: `tls-aws-lc-rs` or `tls-ring`.
+* DoH: `https-aws-lc-rs` or `https-ring`
+* DoQ: `quic-aws-lc-rs` or `quic-ring`
+* DoH3: `h3-aws-lc-rs` or `h3-ring`
+
+## DNSSEC
+
+In order to use DNSSEC you must enable a cargo feature corresponding to your
+desired cryptography provider:
+
+* `dnssec-aws-lc-rs`
+* `dnssec-ring`
+
+The current root key is bundled into the system, and used by default. This gives
+validation of DNSKEY and DS records back to the root. NSEC and NSEC3 are
+implemented.
+
+## Other crate features
+
+* `resolver` - support for DNS query resolving.
+* `recursor` (experimental) - support for recursive resolution.
+* `sqlite` - support maintaining zone data in a SQLite database. Required for dynamic DNS support.
+* `blocklist` - support configuring allow/deny blocklists.
+* `toml` - support for TOML configuration.
+* `metrics` - support exposing metrics using the [`metrics`] crate.
+* `rustls-platform-verifier` - use the system verifier for TLS with
+  [rustls-platform-verifier].
+* `webpki-roots` - use the [webpki-roots] crate for TLS certificate verification.
+
+[rustls-platform-verifier]: https://crates.io/crates/rustls-platform-verifier
+[webpki-roots]: https://crates.io/crates/webpki-roots
+[`metrics`]: https://crates.io/crates/metrics

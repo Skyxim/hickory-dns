@@ -10,9 +10,6 @@ updates:
   - dependency-name: async-trait
     versions:
     - "> 0.1.48, < 0.2"
-  - dependency-name: backtrace
-    versions:
-    - "> 0.3.56, < 0.4"
   - dependency-name: futures
     versions:
     - "< 0.3, >= 0.2.a"
@@ -131,9 +128,6 @@ updates:
   - dependency-name: h2
     versions:
     - 0.3.1
-  - dependency-name: env_logger
-    versions:
-    - 0.8.3
   - dependency-name: idna
     versions:
     - 0.2.1

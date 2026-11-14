@@ -1,0 +1,21 @@
+[package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+name = "compatibility-tests"
+publish = false
+version = "0.1.0"
+
+[dev-dependencies]
+dns-test.workspace = true
+futures.workspace = true
+hickory-net = { workspace = true, features = ["dnssec-ring"] }
+hickory-proto = { workspace = true, features = ["dnssec-ring"] }
+test-support.workspace = true
+time.workspace = true
+tokio.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true

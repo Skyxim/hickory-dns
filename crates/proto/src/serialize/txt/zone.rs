@@ -5,20 +5,23 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use std::{
+use alloc::{
     borrow::Cow,
-    collections::BTreeMap,
-    fs, mem,
+    collections::btree_map::{BTreeMap, Entry},
+    string::String,
+    vec::Vec,
+};
+use core::{mem, str::FromStr};
+use std::{
+    fs,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use crate::{
     rr::{DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType, RrKey},
     serialize::txt::{
-        parse_rdata::RDataParser,
+        ParseError, ParseResult, parse_ttl,
         zone_lex::{Lexer, Token},
-        ParseError, ParseErrorKind, ParseResult,
     },
 };
 
@@ -135,8 +138,11 @@ impl<'a> Parser<'a> {
     pub fn new(
         input: impl Into<Cow<'a, str>>,
         path: Option<PathBuf>,
-        origin: Option<Name>,
+        mut origin: Option<Name>,
     ) -> Self {
+        if let Some(origin) = &mut origin {
+            origin.set_fqdn(true);
+        }
         Self {
             lexers: vec![(Lexer::new(input), path)],
             origin,
@@ -149,12 +155,7 @@ impl<'a> Parser<'a> {
     ///
     /// A pair of the Zone origin name and a map of all Keys to RecordSets
     pub fn parse(mut self) -> ParseResult<(Name, BTreeMap<RrKey, RecordSet>)> {
-        let mut origin = self.origin;
-        let mut records: BTreeMap<RrKey, RecordSet> = BTreeMap::new();
-        let mut class: DNSClass = DNSClass::IN;
-        let mut current_name: Option<Name> = None;
-        let mut rtype: Option<RecordType> = None;
-        let mut ttl: Option<u32> = None;
+        let mut cx = Context::new(self.origin);
         let mut state = State::StartLine;
         let mut stack = self.lexers.len();
 
@@ -163,7 +164,7 @@ impl<'a> Parser<'a> {
                 state = match state {
                     State::StartLine => {
                         // current_name is not reset on the next line b/c it might be needed from the previous
-                        rtype = None;
+                        cx.rtype = None;
 
                         match t {
                             // if Dollar, then $INCLUDE or $ORIGIN
@@ -173,37 +174,37 @@ impl<'a> Parser<'a> {
 
                             // if CharData, then Name then ttl_class_type
                             Token::CharData(data) => {
-                                current_name = Some(Name::parse(&data, origin.as_ref())?);
-                                State::TtlClassType
+                                cx.current_name = Some(Name::parse(&data, cx.origin.as_ref())?);
+                                State::TtlClassType { rr_started: true }
                             }
 
                             // @ is a placeholder for specifying the current origin
                             Token::At => {
-                                current_name.clone_from(&origin); // TODO a COW or RC would reduce copies...
-                                State::TtlClassType
+                                cx.current_name.clone_from(&cx.origin); // TODO a COW or RC would reduce copies...
+                                State::TtlClassType { rr_started: true }
                             }
 
                             // if blank, then nothing or ttl_class_type
-                            Token::Blank => State::TtlClassType,
+                            Token::Blank => State::TtlClassType { rr_started: false },
                             Token::EOL => State::StartLine, // probably a comment
-                            _ => return Err(ParseErrorKind::UnexpectedToken(t).into()),
+                            _ => return Err(ParseError::UnexpectedToken(t)),
                         }
                     }
                     State::Ttl => match t {
                         Token::CharData(data) => {
-                            ttl = Some(Self::parse_time(&data)?);
+                            cx.ttl.default = Some(parse_ttl(&data)?);
                             State::StartLine
                         }
-                        _ => return Err(ParseErrorKind::UnexpectedToken(t).into()),
+                        _ => return Err(ParseError::UnexpectedToken(t)),
                     },
                     State::Origin => {
                         match t {
                             Token::CharData(data) => {
-                                // TODO an origin was specified, should this be legal? definitely confusing...
-                                origin = Some(Name::parse(&data, None)?);
+                                // a relative name is relative to the current origin (RFC 1035 section 5.1)
+                                cx.origin = Some(Name::parse(&data, cx.origin.as_ref())?);
                                 State::StartLine
                             }
-                            _ => return Err(ParseErrorKind::UnexpectedToken(t).into()),
+                            _ => return Err(ParseError::UnexpectedToken(t)),
                         }
                     }
                     State::Include(include_path) => match (t, include_path) {
@@ -220,10 +221,9 @@ impl<'a> Parser<'a> {
                             // and should probably be configurable by user.
 
                             if stack > MAX_INCLUDE_LEVEL {
-                                return Err(ParseErrorKind::Message(
+                                return Err(ParseError::from(
                                     "Max depth level for nested $INCLUDE is reached",
-                                )
-                                .into());
+                                ));
                             }
 
                             let include = Path::new(&include_path);
@@ -234,10 +234,9 @@ impl<'a> Parser<'a> {
                                     .expect("file has to have parent folder")
                                     .join(include),
                                 (false, None) => {
-                                    return Err(ParseErrorKind::Message(
+                                    return Err(ParseError::from(
                                         "Relative $INCLUDE is not supported",
-                                    )
-                                    .into());
+                                    ));
                                 }
                             };
 
@@ -249,45 +248,53 @@ impl<'a> Parser<'a> {
                             continue 'outer;
                         }
                         (Token::CharData(_), Some(_)) => {
-                            return Err(ParseErrorKind::Message(
+                            return Err(ParseError::from(
                                 "Domain name for $INCLUDE is not supported",
-                            )
-                            .into());
+                            ));
                         }
                         (t, _) => {
-                            return Err(ParseErrorKind::UnexpectedToken(t).into());
+                            return Err(ParseError::UnexpectedToken(t));
                         }
                     },
-                    State::TtlClassType => {
+                    State::TtlClassType { rr_started } => {
                         match t {
                             // if number, TTL
-                            // Token::Number(ref num) => ttl = Some(*num),
+                            // Token::Number(num) => ttl = Some(*num),
                             // One of Class or Type (these cannot be overlapping!)
                             Token::CharData(mut data) => {
                                 // if it's a number it's a ttl
-                                let result: ParseResult<u32> = Self::parse_time(&data);
-                                if result.is_ok() {
-                                    ttl = result.ok();
-                                    State::TtlClassType // hm, should this go to just ClassType?
+                                let result: ParseResult<u32> = parse_ttl(&data);
+                                if let Ok(ttl) = result {
+                                    cx.ttl.this = Some(ttl);
+                                    State::TtlClassType { rr_started: true } // hm, should this go to just ClassType?
                                 } else {
                                     // if can parse DNSClass, then class
                                     data.make_ascii_uppercase();
                                     let result = DNSClass::from_str(&data);
                                     if let Ok(parsed) = result {
-                                        class = parsed;
-                                        State::TtlClassType
+                                        // RFC 1035 section 3.6: NONE and ANY (`*`) are only
+                                        // valid as QCLASS values, not as the class of a record.
+                                        if matches!(parsed, DNSClass::NONE | DNSClass::ANY) {
+                                            return Err(ParseError::from(format!(
+                                                "query-only class {data} is not allowed in a zone file"
+                                            )));
+                                        }
+                                        cx.class = parsed;
+                                        State::TtlClassType { rr_started: true }
                                     } else {
                                         // if can parse RecordType, then RecordType
-                                        rtype = Some(RecordType::from_str(&data)?);
+                                        cx.rtype = Some(RecordType::from_str(&data)?);
                                         State::Record(vec![])
                                     }
                                 }
                             }
                             // could be nothing if started with blank and is a comment, i.e. EOL
+                            Token::EOL if !rr_started => State::StartLine,
+                            // an owner, TTL or class was given, but no type
                             Token::EOL => {
-                                State::StartLine // next line
+                                return Err(ParseError::from("record type not specified"));
                             }
-                            _ => return Err(ParseErrorKind::UnexpectedToken(t).into()),
+                            _ => return Err(ParseError::UnexpectedToken(t)),
                         }
                     }
                     State::Record(record_parts) => {
@@ -295,15 +302,7 @@ impl<'a> Parser<'a> {
                         //  tokens to pass into the processor
                         match t {
                             Token::EOL => {
-                                Self::flush_record(
-                                    record_parts,
-                                    &origin,
-                                    &current_name,
-                                    rtype,
-                                    &mut ttl,
-                                    class,
-                                    &mut records,
-                                )?;
+                                cx.insert(record_parts)?;
                                 State::StartLine
                             }
                             Token::CharData(part) => {
@@ -317,23 +316,19 @@ impl<'a> Parser<'a> {
                                 record_parts.extend(list);
                                 State::Record(record_parts)
                             }
-                            _ => return Err(ParseErrorKind::UnexpectedToken(t).into()),
+                            _ => return Err(ParseError::UnexpectedToken(t)),
                         }
                     }
                 };
             }
 
             // Extra flush at the end for the case of missing endline
-            if let State::Record(record_parts) = mem::replace(&mut state, State::StartLine) {
-                Self::flush_record(
-                    record_parts,
-                    &origin,
-                    &current_name,
-                    rtype,
-                    &mut ttl,
-                    class,
-                    &mut records,
-                )?;
+            match mem::replace(&mut state, State::StartLine) {
+                State::Record(record_parts) => cx.insert(record_parts)?,
+                State::TtlClassType { rr_started: true } => {
+                    return Err(ParseError::from("record type not specified"));
+                }
+                _ => {}
             }
 
             stack -= 1;
@@ -342,181 +337,118 @@ impl<'a> Parser<'a> {
 
         //
         // build the Authority and return.
-        let origin = origin.ok_or_else(|| {
-            ParseError::from(ParseErrorKind::Message("$ORIGIN was not specified"))
-        })?;
-        Ok((origin, records))
+        let origin = cx
+            .origin
+            .ok_or_else(|| ParseError::from("$ORIGIN was not specified"))?;
+        Ok((origin, cx.records))
+    }
+}
+
+#[derive(Default)]
+struct Ttl {
+    default: Option<u32>,
+    last: Option<u32>,
+    this: Option<u32>,
+}
+
+impl Ttl {
+    fn take(&mut self) -> Option<u32> {
+        if let Some(ttl) = self.this.take() {
+            self.last.replace(ttl);
+            return Some(ttl);
+        }
+        if let Some(ttl) = self.default {
+            return Some(ttl);
+        }
+        if let Some(ttl) = self.last {
+            return Some(ttl);
+        }
+
+        None
+    }
+}
+
+struct Context {
+    origin: Option<Name>,
+    records: BTreeMap<RrKey, RecordSet>,
+    class: DNSClass,
+    current_name: Option<Name>,
+    rtype: Option<RecordType>,
+    ttl: Ttl,
+}
+
+impl Context {
+    fn new(origin: Option<Name>) -> Self {
+        Self {
+            origin,
+            records: BTreeMap::default(),
+            class: DNSClass::IN,
+            current_name: None,
+            rtype: None,
+            ttl: Ttl::default(),
+        }
     }
 
-    fn flush_record(
-        record_parts: Vec<String>,
-        origin: &Option<Name>,
-        current_name: &Option<Name>,
-        rtype: Option<RecordType>,
-        ttl: &mut Option<u32>,
-        class: DNSClass,
-        records: &mut BTreeMap<RrKey, RecordSet>,
-    ) -> ParseResult<()> {
+    fn insert(&mut self, record_parts: Vec<String>) -> ParseResult<()> {
         // call out to parsers for difference record types
         // all tokens as part of the Record should be chardata...
-        let rtype = rtype.ok_or_else(|| {
-            ParseError::from(ParseErrorKind::Message("record type not specified"))
-        })?;
-        let rdata = RData::parse(
+        let rtype = self
+            .rtype
+            .ok_or_else(|| ParseError::from("record type not specified"))?;
+
+        let rdata = RData::from_tokens(
             rtype,
             record_parts.iter().map(AsRef::as_ref),
-            origin.as_ref(),
+            self.origin.as_ref(),
         )?;
 
         // verify that we have everything we need for the record
         // TODO COW or RC would reduce mem usage, perhaps Name should have an intern()...
         //  might want to wait until RC.weak() stabilizes, as that would be needed for global
         //  memory where you want
-        let name = current_name.clone().ok_or_else(|| {
-            ParseError::from(ParseErrorKind::Message("record name not specified"))
-        })?;
+        let mut name = self
+            .current_name
+            .clone()
+            .ok_or_else(|| ParseError::from("record name not specified"))?;
 
-        // slightly annoying, need to grab the TTL, then move rdata into the record,
-        //  then check the Type again and have custom add logic.
-        let set_ttl = match rtype {
-            RecordType::SOA => {
-                // TTL for the SOA is set internally...
-                // expire is for the SOA, minimum is default for records
-                if let RData::SOA(ref soa) = rdata {
-                    // TODO, this looks wrong, get_expire() should be get_minimum(), right?
-                    let set_ttl = soa.expire() as u32; // the spec seems a little inaccurate with u32 and i32
-                    if ttl.is_none() {
-                        *ttl = Some(soa.minimum());
-                    } // TODO: should this only set it if it's not set?
-                    set_ttl
-                } else {
-                    let msg = format!("Invalid RData here, expected SOA: {rdata:?}");
-                    return ParseResult::Err(ParseError::from(ParseErrorKind::Msg(msg)));
-                }
-            }
-            _ => ttl.ok_or_else(|| {
-                ParseError::from(ParseErrorKind::Message("record ttl not specified"))
-            })?,
-        };
+        let ttl = self
+            .ttl
+            .take()
+            .ok_or_else(|| ParseError::from("record ttl not specified"))?;
 
         // TODO: validate record, e.g. the name of SRV record allows _ but others do not.
 
         // move the rdata into record...
-        let mut record = Record::from_rdata(name, set_ttl, rdata);
-        record.set_dns_class(class);
+        name.set_fqdn(true);
+        let mut record = Record::from_rdata(name, ttl, rdata);
+        record.dns_class = self.class;
 
         // add to the map
-        let key = RrKey::new(LowerName::new(record.name()), record.record_type());
-        match rtype {
-            RecordType::SOA => {
-                let set = record.into();
-                if records.insert(key, set).is_some() {
-                    return Err(ParseErrorKind::Message("SOA is already specified").into());
-                }
+        let entry = self.records.entry(RrKey::new(
+            LowerName::new(&record.name),
+            record.record_type(),
+        ));
+        match (rtype, entry) {
+            (RecordType::SOA, Entry::Occupied(_)) => {
+                return Err(ParseError::from("SOA is already specified"));
             }
-            _ => {
-                // add a Vec if it's not there, then add the record to the list
-                let set = records
-                    .entry(key)
-                    .or_insert_with(|| RecordSet::new(record.name(), record.record_type(), 0));
-                set.insert(record, 0);
+            (_, Entry::Vacant(entry)) => {
+                entry.insert(RecordSet::from(record));
             }
-        }
+            (_, Entry::Occupied(mut entry)) => {
+                entry.get_mut().insert(record, 0);
+            }
+        };
+
         Ok(())
-    }
-
-    /// parses the string following the rules from:
-    ///  <https://tools.ietf.org/html/rfc2308> (NXCaching RFC) and
-    ///  <https://www.zytrax.com/books/dns/apa/time.html>
-    ///
-    /// default is seconds
-    /// #s = seconds = # x 1 seconds (really!)
-    /// #m = minutes = # x 60 seconds
-    /// #h = hours   = # x 3600 seconds
-    /// #d = day     = # x 86400 seconds
-    /// #w = week    = # x 604800 seconds
-    ///
-    /// returns the result of the parsing or and error
-    ///
-    /// # Example
-    /// ```
-    /// use hickory_proto::serialize::txt::Parser;
-    ///
-    /// assert_eq!(Parser::parse_time("0").unwrap(),  0);
-    /// assert!(Parser::parse_time("s").is_err());
-    /// assert!(Parser::parse_time("").is_err());
-    /// assert_eq!(Parser::parse_time("0s").unwrap(), 0);
-    /// assert_eq!(Parser::parse_time("1").unwrap(),  1);
-    /// assert_eq!(Parser::parse_time("1S").unwrap(), 1);
-    /// assert_eq!(Parser::parse_time("1s").unwrap(), 1);
-    /// assert_eq!(Parser::parse_time("1M").unwrap(), 60);
-    /// assert_eq!(Parser::parse_time("1m").unwrap(), 60);
-    /// assert_eq!(Parser::parse_time("1H").unwrap(), 3600);
-    /// assert_eq!(Parser::parse_time("1h").unwrap(), 3600);
-    /// assert_eq!(Parser::parse_time("1D").unwrap(), 86400);
-    /// assert_eq!(Parser::parse_time("1d").unwrap(), 86400);
-    /// assert_eq!(Parser::parse_time("1W").unwrap(), 604800);
-    /// assert_eq!(Parser::parse_time("1w").unwrap(), 604800);
-    /// assert_eq!(Parser::parse_time("1s2d3w4h2m").unwrap(), 1+2*86400+3*604800+4*3600+2*60);
-    /// assert_eq!(Parser::parse_time("3w3w").unwrap(), 3*604800+3*604800);
-    /// assert!(Parser::parse_time("7102w").is_err());
-    /// ```
-    pub fn parse_time(ttl_str: &str) -> ParseResult<u32> {
-        if ttl_str.is_empty() {
-            return Err(ParseErrorKind::ParseTime(ttl_str.to_string()).into());
-        }
-
-        let (mut state, mut value) = (None, 0_u32);
-        for (i, c) in ttl_str.chars().enumerate() {
-            let start = match (state, c) {
-                (None, '0'..='9') => {
-                    state = Some(i);
-                    continue;
-                }
-                (Some(_), '0'..='9') => continue,
-                (Some(start), 'S' | 's' | 'M' | 'm' | 'H' | 'h' | 'D' | 'd' | 'W' | 'w') => start,
-                _ => return Err(ParseErrorKind::ParseTime(ttl_str.to_string()).into()),
-            };
-
-            // All allowed chars are ASCII, so using char indexes to slice &[u8] is OK
-            let number = u32::from_str(&ttl_str[start..i])
-                .map_err(|_| ParseErrorKind::ParseTime(ttl_str.to_string()))?;
-
-            let multiplier = match c {
-                'S' | 's' => 1,
-                'M' | 'm' => 60,
-                'H' | 'h' => 3_600,
-                'D' | 'd' => 86_400,
-                'W' | 'w' => 604_800,
-                _ => unreachable!(),
-            };
-
-            value = number
-                .checked_mul(multiplier)
-                .and_then(|add| value.checked_add(add))
-                .ok_or_else(|| ParseErrorKind::ParseTime(ttl_str.to_string()))?;
-
-            state = None;
-        }
-
-        if let Some(start) = state {
-            // All allowed chars are ASCII, so using char indexes to slice &[u8] is OK
-            let number = u32::from_str(&ttl_str[start..])
-                .map_err(|_| ParseErrorKind::ParseTime(ttl_str.to_string()))?;
-            value = value
-                .checked_add(number)
-                .ok_or_else(|| ParseErrorKind::ParseTime(ttl_str.to_string()))?;
-        }
-
-        Ok(value)
     }
 }
 
-#[allow(unused)]
 enum State {
-    StartLine,    // start of line, @, $<WORD>, Name, Blank
-    TtlClassType, // [<TTL>] [<class>] <type>,
-    Ttl,          // $TTL <time>
+    StartLine, // start of line, @, $<WORD>, Name, Blank
+    // [<TTL>] [<class>] <type>; `rr_started` is set once an owner, TTL or class was given
+    TtlClassType { rr_started: bool },
+    Ttl, // $TTL <time>
     Record(Vec<String>),
     Include(Option<String>), // $INCLUDE <filename>
     Origin,
@@ -527,10 +459,11 @@ const MAX_INCLUDE_LEVEL: usize = 256;
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::*;
 
     #[test]
-    #[allow(clippy::uninlined_format_args)]
     fn test_zone_parse() {
         let domain = Name::from_str("parameter.origin.org.").unwrap();
 
@@ -546,8 +479,116 @@ mod tests {
                     .unwrap_err()
                     .to_string()
                     .contains("FAULTY-RECORD-TYPE"),
-            "unexpected success: {:#?}",
-            result
+            "unexpected success: {result:#?}"
+        );
+    }
+
+    #[test]
+    fn test_missing_record_type() {
+        // https://github.com/hickory-dns/hickory-dns/issues/3952
+        for rr in [
+            "www 3600 IN",
+            "www IN",
+            "www 3600",
+            "www",
+            "@ 3600 IN",
+            " 3600 IN",
+            "www 3600 IN ; comment",
+        ] {
+            for eol in ["\n", ""] {
+                let zone_data = format!("$ORIGIN example.com.\n$TTL 3600\n{rr}{eol}");
+                let result = Parser::new(zone_data, None, None).parse();
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|e| e.to_string().contains("record type not specified")),
+                    "unexpected result for {rr:?}: {result:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_relative_origin() {
+        let zone_data = "$ORIGIN example.com.
+$TTL 3600
+$ORIGIN sub
+www IN A 192.0.2.1
+$ORIGIN deeper
+@ IN A 192.0.2.2
+";
+        let (_, records) = Parser::new(zone_data, None, None).parse().unwrap();
+        let owners = records
+            .values()
+            .map(|rrset| rrset.name().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owners,
+            ["deeper.sub.example.com.", "www.sub.example.com."],
+            "unexpected owners: {owners:?}"
+        );
+    }
+
+    #[test]
+    fn test_blank_and_comment_lines() {
+        let zone_data = [
+            "$ORIGIN example.com.",
+            "$TTL 3600",
+            "",
+            "\t ",
+            "; comment",
+            "   ; indented comment",
+            "www 3600 IN A 192.0.2.1",
+            " \t",
+        ]
+        .join("\n");
+        let (origin, records) = Parser::new(zone_data, None, None).parse().unwrap();
+        assert_eq!(origin, Name::from_str("example.com.").unwrap());
+        assert_eq!(records.len(), 1);
+        let rrset = records.values().next().unwrap();
+        assert_eq!(rrset.name(), &Name::from_str("www.example.com.").unwrap());
+        assert_eq!(rrset.record_type(), RecordType::A);
+    }
+
+    #[test]
+    fn test_query_only_class_is_rejected() {
+        // https://github.com/hickory-dns/hickory-dns/issues/3956
+        for rr in [
+            "www 3600 ANY A 192.0.2.1",
+            "www 3600 * A 192.0.2.1",
+            "www 3600 NONE A 192.0.2.1",
+            "www ANY 3600 A 192.0.2.1",
+            "www 3600 any A 192.0.2.1",
+        ] {
+            let zone_data = format!("$ORIGIN example.com.\n{rr}\n");
+            let result = Parser::new(zone_data, None, None).parse();
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("query-only class")),
+                "unexpected result for {rr:?}: {result:#?}"
+            );
+        }
+
+        for rr in ["www 3600 IN A 192.0.2.1", "www 3600 CH A 192.0.2.1"] {
+            let zone_data = format!("$ORIGIN example.com.\n{rr}\n");
+            Parser::new(zone_data, None, None).parse().unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_txt_record_is_rejected() {
+        let domain = Name::from_str("example.com.").unwrap();
+
+        let zone_data = r#"$ORIGIN example.com.
+empty 300 IN TXT
+"#;
+
+        let result = Parser::new(zone_data, None, Some(domain)).parse();
+
+        assert!(
+            result.is_err(),
+            "an empty TXT record should be rejected: {result:#?}"
         );
     }
 }

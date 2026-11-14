@@ -7,21 +7,28 @@
 
 //! domain name, aka labels, implementation
 
-use std::borrow::Borrow;
-use std::cmp::{Ordering, PartialEq};
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::str::FromStr;
+#[cfg(feature = "serde")]
+use alloc::string::{String, ToString};
+use core::cmp::{Ordering, PartialEq};
+use core::fmt;
+use core::hash::{Hash, Hasher};
+use core::ops::Deref;
+use core::str::FromStr;
 
 use crate::error::*;
-#[cfg(feature = "serde-config")]
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::rr::Name;
 use crate::serialize::binary::*;
 
-/// TODO: all LowerNames should be stored in a global "intern" space, and then everything that uses
-///  them should be through references. As a workaround the Strings are all Rc as well as the array
+/// Like [`Name`], except guaranteed to be in lower case form.
+///
+/// This guarantee is helpful for performance reasons, as case-sensitive comparisons
+/// can be done faster. Name comparison is a frequent operation and so overall performance
+/// benefits.
+// TODO: all LowerNames should be stored in a global "intern" space, and then everything that uses
+//  them should be through references. As a workaround the Strings are all Rc as well as the array
 #[derive(Default, Debug, Eq, Clone)]
 pub struct LowerName(Name);
 
@@ -142,17 +149,6 @@ impl LowerName {
         self.0.is_empty()
     }
 
-    /// Emits the canonical version of the name to the encoder.
-    ///
-    /// In canonical form, there will be no pointers written to the encoder (i.e. no compression).
-    pub fn emit_as_canonical(
-        &self,
-        encoder: &mut BinEncoder<'_>,
-        canonical: bool,
-    ) -> ProtoResult<()> {
-        self.0.emit_as_canonical(encoder, canonical)
-    }
-
     /// Pass through for Name::is_wildcard
     pub fn is_wildcard(&self) -> bool {
         self.0.is_wildcard()
@@ -170,8 +166,9 @@ impl Hash for LowerName {
     where
         H: Hasher,
     {
+        self.0.is_fqdn().hash(state);
         for label in &self.0 {
-            state.write(label);
+            label.hash(state);
         }
     }
 }
@@ -184,8 +181,7 @@ impl PartialEq<Self> for LowerName {
 
 impl BinEncodable for LowerName {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        let is_canonical_names = encoder.is_canonical_names();
-        self.emit_as_canonical(encoder, is_canonical_names)
+        self.0.emit(encoder)
     }
 }
 
@@ -207,7 +203,7 @@ impl Ord for LowerName {
     /// ```text
     /// RFC 4034                DNSSEC Resource Records               March 2005
     ///
-    /// 6.1.  Canonical DNS LowerName Order
+    /// 6.1.  Canonical DNS Name Order
     ///
     ///  For the purposes of DNS security, owner names are ordered by treating
     ///  individual labels as unsigned left-justified octet strings.  The
@@ -266,18 +262,19 @@ impl<'a> From<&'a LowerName> for Name {
     }
 }
 
-impl Borrow<Name> for LowerName {
-    fn borrow(&self) -> &Name {
+impl Deref for LowerName {
+    type Target = Name;
+
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<'r> BinDecodable<'r> for LowerName {
-    /// parses the chain of labels
-    ///  this has a max of 255 octets, with each label being less than 63.
-    ///  all names will be stored lowercase internally.
-    /// This will consume the portions of the Vec which it is reading...
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    /// Parses a domain name and converts it to lowercase.
+    ///
+    /// The maximum length of a name is 255 octets, and the maximum length of each label is 63.
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let name = Name::read(decoder)?;
         Ok(Self(name.to_lowercase()))
     }
@@ -291,7 +288,7 @@ impl FromStr for LowerName {
     }
 }
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 impl Serialize for LowerName {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -301,7 +298,7 @@ impl Serialize for LowerName {
     }
 }
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for LowerName {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -309,5 +306,63 @@ impl<'de> Deserialize<'de> for LowerName {
     {
         let s = String::deserialize(deserializer)?;
         FromStr::from_str(&s).map_err(de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "std")]
+    use core::hash::{Hash, Hasher};
+    #[cfg(feature = "std")]
+    use std::hash::DefaultHasher;
+
+    use crate::rr::{LowerName, Name};
+
+    #[test]
+    fn test_name_lowername_roundtrip() {
+        // Test that roundtrip conversions from Name <-> LowerName <-> Name are
+        // equal and preserve is_fqdn.
+        let fqdn_name = Name::from_ascii("example.com.").unwrap();
+        let relative_name = Name::from_ascii("example.com").unwrap();
+
+        let fqdn_lname = LowerName::from(fqdn_name.clone());
+        let relative_lname = LowerName::from(relative_name.clone());
+
+        let fqdn_rt_name: Name = fqdn_lname.into();
+        let relative_rt_name: Name = relative_lname.into();
+
+        assert_eq!(fqdn_name, fqdn_rt_name);
+        assert_eq!(relative_name, relative_rt_name);
+        assert!(fqdn_rt_name != relative_rt_name);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_hash_fqdn() {
+        // verify that two identical names with and without the trailing dot don't hash to the same
+        // value
+        let with_dot = LowerName::from(Name::from_utf8("com.").unwrap());
+        let hash_with_dot = hash(&with_dot);
+
+        let without_dot = LowerName::from(Name::from_utf8("com").unwrap());
+        let hash_without_dot = hash(&without_dot);
+        assert_ne!(with_dot, without_dot);
+        assert_ne!(hash_with_dot, hash_without_dot);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_hash_label_boundaries() {
+        let ab_c = LowerName::from(Name::parse("ab.c.", None).unwrap());
+        let a_bc = LowerName::from(Name::parse("a.bc.", None).unwrap());
+        assert_ne!(ab_c, a_bc);
+        assert_ne!(hash(&ab_c), hash(&a_bc));
+    }
+
+    #[cfg(feature = "std")]
+    fn hash(name: &LowerName) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        hasher.finish()
     }
 }

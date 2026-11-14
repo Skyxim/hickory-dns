@@ -30,75 +30,38 @@
 //! the description of name server logic in [RFC-1034] for details.
 //! ```
 
-use std::{fmt, ops::Deref};
+use core::{fmt, ops::Deref};
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::ProtoResult,
-    rr::{domain::Name, RData, RecordData, RecordType},
+    rr::{RData, RecordData, RecordType, domain::Name},
     serialize::binary::*,
 };
 
-/// Read the RData from the given Decoder
-pub fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<Name> {
-    Name::read(decoder)
-}
-
-/// [RFC 4034](https://tools.ietf.org/html/rfc4034#section-6), DNSSEC Resource Records, March 2005
-///
-/// This is accurate for all currently known name records.
-///
-/// ```text
-/// 6.2.  Canonical RR Form
-///
-///    For the purposes of DNS security, the canonical form of an RR is the
-///    wire format of the RR where:
-///
-///    ...
-///
-///    3.  if the type of the RR is NS, MD, MF, CNAME, SOA, MB, MG, MR, PTR,
-///        HINFO, MINFO, MX, HINFO, RP, AFSDB, RT, SIG, PX, NXT, NAPTR, KX,
-///        SRV, DNAME, A6, RRSIG, or (rfc6840 removes NSEC), all uppercase
-///        US-ASCII letters in the DNS names contained within the RDATA are replaced
-///        by the corresponding lowercase US-ASCII letters;
-/// ```
-pub fn emit(encoder: &mut BinEncoder<'_>, name_data: &Name) -> ProtoResult<()> {
-    let is_canonical_names = encoder.is_canonical_names();
-
-    // to_lowercase for rfc4034 and rfc6840
-    name_data.emit_with_lowercase(encoder, is_canonical_names)?;
-    Ok(())
-}
-
 macro_rules! name_rdata {
-    ($name: ident) => {
+    ($name: ident, $rdata_policy: expr) => {
         #[doc = stringify!(new type for the RecordData of $name)]
-        #[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+        #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
         #[derive(Debug, PartialEq, Eq, Hash, Clone)]
         pub struct $name(pub Name);
 
         impl BinEncodable for $name {
             fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-                emit(encoder, &self.0)
+                let mut encoder = encoder.with_rdata_behavior($rdata_policy);
+                self.0.emit(&mut encoder)
             }
         }
 
         impl<'r> BinDecodable<'r> for $name {
-            fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+            fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
                 Name::read(decoder).map(Self)
             }
         }
 
         impl RecordData for $name {
-            fn try_from_rdata(data: RData) -> Result<Self, RData> {
-                match data {
-                    RData::$name(data) => Ok(data),
-                    _ => Err(data),
-                }
-            }
-
             fn try_borrow(data: &RData) -> Option<&Self> {
                 match data {
                     RData::$name(data) => Some(data),
@@ -131,36 +94,19 @@ macro_rules! name_rdata {
     };
 }
 
-name_rdata!(CNAME);
-name_rdata!(NS);
-name_rdata!(PTR);
-name_rdata!(ANAME);
+name_rdata!(CNAME, RDataEncoding::StandardRecord);
+name_rdata!(NS, RDataEncoding::StandardRecord);
+name_rdata!(PTR, RDataEncoding::StandardRecord);
+name_rdata!(ANAME, RDataEncoding::Other);
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
 
     use super::*;
 
     #[test]
     fn test_it_to_string_should_not_stack_overflow() {
         assert_eq!(PTR("abc.com".parse().unwrap()).to_string(), "abc.com");
-    }
-
-    #[test]
-    fn test() {
-        #![allow(clippy::dbg_macro, clippy::print_stdout)]
-
-        let rdata = Name::from_ascii("WWW.example.com.").unwrap();
-
-        let mut bytes = Vec::new();
-        let mut encoder: BinEncoder<'_> = BinEncoder::new(&mut bytes);
-        assert!(emit(&mut encoder, &rdata).is_ok());
-        let bytes = encoder.into_bytes();
-
-        println!("bytes: {bytes:?}");
-
-        let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
-        let read_rdata = read(&mut decoder).expect("Decoding error");
-        assert_eq!(rdata, read_rdata);
     }
 }

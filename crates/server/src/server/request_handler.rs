@@ -9,43 +9,89 @@
 
 use std::net::SocketAddr;
 
+use bytes::Bytes;
+use hickory_proto::op::{DEFAULT_MAX_PAYLOAD_LEN, Edns, LowerQuery};
+
+#[cfg(any(test, feature = "testing"))]
+use crate::proto::serialize::binary::{BinEncodable, BinEncoder};
 use crate::{
-    authority::MessageRequest,
-    proto::op::{Header, LowerQuery, ResponseCode},
-    server::{Protocol, ResponseHandler},
+    net::{runtime::Time, xfer::Protocol},
+    proto::{
+        ProtoError,
+        op::{Header, MessageRequest, Metadata},
+        serialize::binary::{BinDecodable, BinDecoder},
+    },
 };
 
 /// An incoming request to the DNS catalog
 #[derive(Debug)]
 pub struct Request {
     /// Message with the associated query or update data
-    message: MessageRequest,
+    pub(crate) message: MessageRequest,
+    pub(crate) response_edns: Option<Edns>,
+    pub(super) raw: Bytes,
     /// Source address of the Client
-    src: SocketAddr,
+    pub(super) src: SocketAddr,
     /// Protocol of the request
-    protocol: Protocol,
+    pub(super) protocol: Protocol,
 }
 
 impl Request {
-    /// Build a new requests with the inbound message, source address, and protocol.
+    /// Construct a new Request from the raw bytes, source address, and protocol
     ///
-    /// This will return an error on bad verification.
-    pub fn new(message: MessageRequest, src: SocketAddr, protocol: Protocol) -> Self {
-        Self {
+    /// This is only used in tests.
+    #[doc(hidden)]
+    pub fn from_bytes(
+        raw: Vec<u8>,
+        src: SocketAddr,
+        protocol: Protocol,
+    ) -> Result<Self, ProtoError> {
+        let mut decoder = BinDecoder::new(&raw);
+        let header = Header::read(&mut decoder)?;
+        let message = MessageRequest::read(&mut decoder, header)?;
+
+        let response_edns = message
+            .edns
+            .as_ref()
+            // Ignore bad EDNS version errors here -- only used for testing
+            .map(|edns| Edns::for_response(edns, DEFAULT_MAX_PAYLOAD_LEN, None).0);
+
+        Ok(Self {
             message,
+            response_edns,
+            raw: Bytes::from(raw),
             src,
             protocol,
-        }
+        })
     }
 
-    /// Return just the header and request information from the Request Message
-    pub fn request_info(&self) -> RequestInfo<'_> {
-        RequestInfo {
-            src: self.src,
-            protocol: self.protocol,
-            header: self.message.header(),
-            query: self.message.query(),
-        }
+    /// Construct a new Request from the encoding of a MessageRequest, source address, and protocol
+    #[cfg(any(test, feature = "testing"))]
+    pub fn from_message(
+        message: MessageRequest,
+        src: SocketAddr,
+        protocol: Protocol,
+    ) -> Result<Self, ProtoError> {
+        let mut encoded = Vec::new();
+        let mut encoder = BinEncoder::new(&mut encoded);
+        message.emit(&mut encoder)?;
+
+        Ok(Self {
+            message,
+            response_edns: None,
+            raw: Bytes::from(encoded),
+            src,
+            protocol,
+        })
+    }
+
+    pub(crate) fn max_payload_size(&self) -> Option<u16> {
+        self.message.edns.as_ref().map(|edns| edns.max_payload())
+    }
+
+    /// The query contained in the request
+    pub fn query(&self) -> &LowerQuery {
+        &self.message.queries
     }
 
     /// The IP address from which the request originated.
@@ -57,6 +103,11 @@ impl Request {
     pub fn protocol(&self) -> Protocol {
         self.protocol
     }
+
+    /// The raw bytes of the request
+    pub fn as_slice(&self) -> &[u8] {
+        &self.raw
+    }
 }
 
 impl std::ops::Deref for Request {
@@ -67,69 +118,26 @@ impl std::ops::Deref for Request {
     }
 }
 
-// TODO: add ProtocolInfo that would have TLS details or other additional things...
-/// A narrow view of the Request, specifically a verified single query for the request
-#[non_exhaustive]
-#[derive(Clone)]
-pub struct RequestInfo<'a> {
-    /// The source address from which the request came
-    pub src: SocketAddr,
-    /// The protocol used for the request
-    pub protocol: Protocol,
-    /// The header from the original request
-    pub header: &'a Header,
-    /// The query from the request
-    pub query: &'a LowerQuery,
-}
-
-impl<'a> RequestInfo<'a> {
-    /// Construct a new RequestInfo
-    ///
-    /// # Arguments
-    ///
-    /// * `src` - The source address from which the request came
-    /// * `protocol` - The protocol used for the request
-    /// * `header` - The header from the original request
-    /// * `query` - The query from the request, LowerQuery is intended to reduce complexity for lookups in authorities
-    pub fn new(
-        src: SocketAddr,
-        protocol: Protocol,
-        header: &'a Header,
-        query: &'a LowerQuery,
-    ) -> Self {
-        Self {
-            src,
-            protocol,
-            header,
-            query,
-        }
-    }
-}
-
 /// Information about the response sent for a request
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub struct ResponseInfo(Header);
-
-impl ResponseInfo {
-    pub(crate) fn serve_failed() -> Self {
-        let mut header = Header::new();
-        header.set_response_code(ResponseCode::ServFail);
-        header.into()
-    }
-}
-
-impl From<Header> for ResponseInfo {
-    fn from(header: Header) -> Self {
-        Self(header)
-    }
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct ResponseInfo {
+    /// Header for this response
+    pub header: Header,
+    /// The TTL this response may be cached for, if it is cacheable.
+    ///
+    /// `None` means the response is not cacheable. The TTL is derived while the response is
+    /// encoded, so a `ResponseInfo` from any other source reports `None`.
+    pub cache_ttl: Option<u32>,
+    /// The encoded response message
+    pub bytes: Vec<u8>,
 }
 
 impl std::ops::Deref for ResponseInfo {
-    type Target = Header;
+    type Target = Metadata;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.header.metadata
     }
 }
 
@@ -138,36 +146,10 @@ impl std::ops::Deref for ResponseInfo {
 pub trait RequestHandler: Send + Sync + Unpin + 'static {
     /// Determines what needs to happen given the type of request, i.e. Query or Update.
     ///
+    /// Returns the encoded response message to send back to the client.
+    ///
     /// # Arguments
     ///
     /// * `request` - the requested action to perform.
-    /// * `response_handle` - handle to which a return message should be sent
-    async fn handle_request<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        response_handle: R,
-    ) -> ResponseInfo;
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::proto::op::{Header, Query};
-    use crate::server::Protocol;
-
-    use super::RequestInfo;
-
-    #[test]
-    fn request_info_clone() {
-        let query: Query = Query::new();
-        let header = Header::new();
-        let lower_query = query.into();
-        let origin = RequestInfo::new(
-            "127.0.0.1:3000".parse().unwrap(),
-            Protocol::Udp,
-            &header,
-            &lower_query,
-        );
-        let cloned = origin.clone();
-        assert_eq!(origin.header, cloned.header);
-    }
+    async fn handle_request<T: Time>(&self, request: &Request) -> ResponseInfo;
 }

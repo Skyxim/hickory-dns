@@ -5,7 +5,7 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use std::fmt::{self, Display};
+use core::fmt::{self, Display};
 
 use crate::error::*;
 use crate::op::Query;
@@ -13,7 +13,11 @@ use crate::rr::LowerName;
 use crate::rr::{DNSClass, RecordType};
 use crate::serialize::binary::*;
 
-/// Identical to [crate::op::Query], except that the Name is guaranteed to be in lower case form
+/// Identical to [`Query`], except that the Name is guaranteed to be in lower case form.
+///
+/// This guarantee is helpful for performance reasons, as case-sensitive comparisons
+/// can be done faster. Name comparison is a frequent operation and so overall performance
+/// benefits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LowerQuery {
     name: LowerName,
@@ -21,14 +25,6 @@ pub struct LowerQuery {
 }
 
 impl LowerQuery {
-    /// Create a new query from name and type, class defaults to IN
-    pub fn query(query: Query) -> Self {
-        Self {
-            name: LowerName::new(query.name()),
-            original: query,
-        }
-    }
-
     /// ```text
     /// QNAME           a domain name represented as a sequence of labels, where
     ///                 each label consists of a length octet followed by that
@@ -53,7 +49,7 @@ impl LowerQuery {
     ///                 can match more than one type of RR.
     /// ```
     pub fn query_type(&self) -> RecordType {
-        self.original.query_type()
+        self.original.query_type
     }
 
     /// ```text
@@ -61,13 +57,23 @@ impl LowerQuery {
     ///                 For example, the QCLASS field is IN for the Internet.
     /// ```
     pub fn query_class(&self) -> DNSClass {
-        self.original.query_class()
+        self.original.query_class
+    }
+}
+
+impl<'r> BinDecodable<'r> for LowerQuery {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
+        let original = Query::read(decoder)?;
+        Ok(Self::from(original))
     }
 }
 
 impl From<Query> for LowerQuery {
     fn from(query: Query) -> Self {
-        Self::query(query)
+        Self {
+            name: LowerName::new(&query.name),
+            original: query,
+        }
     }
 }
 
@@ -77,21 +83,12 @@ impl BinEncodable for LowerQuery {
     }
 }
 
-impl<'r> BinDecodable<'r> for LowerQuery {
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
-        let original = Query::read(decoder)?;
-        Ok(Self::query(original))
-    }
-}
-
 impl Display for LowerQuery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(
             f,
             "name: {} type: {} class: {}",
-            self.name,
-            self.original.query_type(),
-            self.original.query_class()
+            self.name, self.original.query_type, self.original.query_class
         )
     }
 }

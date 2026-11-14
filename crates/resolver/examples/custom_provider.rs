@@ -1,25 +1,31 @@
-#![recursion_limit = "128"]
-
-#[cfg(any(feature = "webpki-roots", feature = "native-certs"))]
+#[cfg(all(
+    any(feature = "webpki-roots", feature = "rustls-platform-verifier"),
+    feature = "__https"
+))]
+use hickory_resolver::config::CLOUDFLARE;
+#[cfg(any(feature = "webpki-roots", feature = "rustls-platform-verifier"))]
 use {
-    hickory_resolver::config::{ResolverConfig, ResolverOpts},
-    hickory_resolver::name_server::{ConnectionProvider, GenericConnector, RuntimeProvider},
-    hickory_resolver::proto::iocompat::AsyncIoTokioAsStd,
-    hickory_resolver::proto::TokioTime,
-    hickory_resolver::{AsyncResolver, TokioHandle},
+    hickory_resolver::{
+        ConnectionProvider, Resolver,
+        config::{GOOGLE, ResolverConfig},
+        net::runtime::{RuntimeProvider, TokioHandle, TokioTime, iocompat::AsyncIoTokioAsStd},
+    },
     std::future::Future,
-    std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    std::io,
+    std::net::SocketAddr,
     std::pin::Pin,
-    tokio::net::{TcpStream, UdpSocket},
+    std::time::Duration,
+    tokio::net::{TcpSocket, TcpStream, UdpSocket},
+    tokio::time::timeout,
 };
 
-#[cfg(any(feature = "webpki-roots", feature = "native-certs"))]
+#[cfg(any(feature = "webpki-roots", feature = "rustls-platform-verifier"))]
 #[derive(Clone, Default)]
 struct PrintProvider {
     handle: TokioHandle,
 }
 
-#[cfg(any(feature = "webpki-roots", feature = "native-certs"))]
+#[cfg(any(feature = "webpki-roots", feature = "rustls-platform-verifier"))]
 impl RuntimeProvider for PrintProvider {
     type Handle = TokioHandle;
     type Timer = TokioTime;
@@ -33,11 +39,30 @@ impl RuntimeProvider for PrintProvider {
     fn connect_tcp(
         &self,
         server_addr: SocketAddr,
-    ) -> Pin<Box<dyn Send + Future<Output = std::io::Result<Self::Tcp>>>> {
-        println!("Create tcp server_addr: {}", server_addr);
+        bind_addr: Option<SocketAddr>,
+        wait_for: Option<Duration>,
+    ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Tcp, io::Error>>>> {
         Box::pin(async move {
-            let tcp = TcpStream::connect(server_addr).await?;
-            Ok(AsyncIoTokioAsStd(tcp))
+            let socket = match server_addr {
+                SocketAddr::V4(_) => TcpSocket::new_v4(),
+                SocketAddr::V6(_) => TcpSocket::new_v6(),
+            }?;
+
+            if let Some(bind_addr) = bind_addr {
+                socket.bind(bind_addr)?;
+            }
+
+            socket.set_nodelay(true)?;
+            let future = socket.connect(server_addr);
+            let wait_for = wait_for.unwrap_or_else(|| Duration::from_secs(5));
+            match timeout(wait_for, future).await {
+                Ok(Ok(socket)) => Ok(AsyncIoTokioAsStd(socket)),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "TCP connect timed out",
+                )),
+            }
         })
     }
 
@@ -45,65 +70,61 @@ impl RuntimeProvider for PrintProvider {
         &self,
         local_addr: SocketAddr,
         server_addr: SocketAddr,
-    ) -> Pin<Box<dyn Send + Future<Output = std::io::Result<Self::Udp>>>> {
+    ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Udp, io::Error>>>> {
         // The server_addr parameter is used only when you need to establish a tunnel or something similar.
         // For example, you try to use a http proxy and encapsulate UDP packets inside a TCP stream.
-        println!(
-            "Create udp local_addr: {}, server_addr: {}",
-            local_addr, server_addr
-        );
-        Box::pin(UdpSocket::bind(local_addr))
+        println!("Create udp local_addr: {local_addr}, server_addr: {server_addr}");
+        Box::pin(async move { UdpSocket::bind(local_addr).await })
     }
 }
 
-#[cfg(any(feature = "webpki-roots", feature = "native-certs"))]
-async fn lookup_test<R: ConnectionProvider>(resolver: AsyncResolver<R>) {
+#[cfg(any(feature = "webpki-roots", feature = "rustls-platform-verifier"))]
+async fn lookup_test<R: ConnectionProvider>(resolver: Resolver<R>) {
     let response = resolver.lookup_ip("www.example.com.").await.unwrap();
 
-    // There can be many addresses associated with the name,
-    //  this can return IPv4 and/or IPv6 addresses
-    let address = response.iter().next().expect("no addresses returned!");
-    if address.is_ipv4() {
-        assert_eq!(address, IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)));
-    } else {
-        assert_eq!(
-            address,
-            IpAddr::V6(Ipv6Addr::new(
-                0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c
-            ))
-        );
-    }
+    assert_ne!(response.iter().count(), 0, "no addresses returned!");
 }
 
-#[cfg(any(feature = "webpki-roots", feature = "native-certs"))]
+#[cfg(any(feature = "webpki-roots", feature = "rustls-platform-verifier"))]
 #[tokio::main]
 async fn main() {
-    let resolver = AsyncResolver::new(
-        ResolverConfig::google(),
-        ResolverOpts::default(),
-        GenericConnector::new(PrintProvider::default()),
-    );
+    tracing_subscriber::fmt::init();
+    run().await;
+}
+
+#[cfg(any(feature = "webpki-roots", feature = "rustls-platform-verifier"))]
+async fn run() {
+    let resolver = Resolver::builder_with_config(
+        ResolverConfig::udp_and_tcp(&GOOGLE),
+        PrintProvider::default(),
+    )
+    .build()
+    .unwrap();
+
     lookup_test(resolver).await;
 
-    #[cfg(feature = "dns-over-https-rustls")]
+    #[cfg(feature = "__https")]
     {
-        let resolver2 = AsyncResolver::new(
-            ResolverConfig::cloudflare_https(),
-            ResolverOpts::default(),
-            GenericConnector::new(PrintProvider::default()),
-        );
+        let resolver2 = Resolver::builder_with_config(
+            ResolverConfig::https(&CLOUDFLARE),
+            PrintProvider::default(),
+        )
+        .build()
+        .unwrap();
         lookup_test(resolver2).await;
     }
 
     println!("Hello, world!");
 }
 
-#[cfg(not(any(feature = "webpki-roots", feature = "native-certs")))]
+#[cfg(not(any(feature = "webpki-roots", feature = "rustls-platform-verifier")))]
 fn main() {
-    println!("either `webpki-roots` or `native-certs` feature must be enabled")
+    println!("either `webpki-roots` or `rustls-platform-verifier` feature must be enabled")
 }
 
-#[test]
-fn test_custom_provider() {
-    main()
+#[cfg(any(feature = "webpki-roots", feature = "rustls-platform-verifier"))]
+#[tokio::test]
+async fn test_custom_provider() {
+    test_support::subscribe();
+    run().await;
 }

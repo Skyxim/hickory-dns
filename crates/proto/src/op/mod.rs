@@ -17,23 +17,46 @@
 //! Operations to send with a `Client` or server, e.g. `Query`, `Message`, or `UpdateMessage` can
 //! be used together to either query or update resource records sets.
 
-mod edns;
-pub mod header;
-mod lower_query;
-pub mod message;
-pub mod op_code;
-pub mod query;
-pub mod response_code;
-pub mod update_message;
+use core::time::Duration;
 
-pub use self::edns::Edns;
-pub use self::header::Header;
-pub use self::header::MessageType;
-pub use self::message::{
-    Message, MessageFinalizer, MessageParts, MessageVerifier, NoopMessageFinalizer,
-};
-pub use self::op_code::OpCode;
-pub use self::query::Query;
-pub use self::response_code::ResponseCode;
+mod dns_request;
+pub use dns_request::{DnsRequest, DnsRequestOptions};
+
+mod dns_response;
+pub use dns_response::DnsResponse;
+
+mod edns;
+pub use edns::{DEFAULT_MAX_PAYLOAD_LEN, Edns, EdnsFlags};
+
+mod header;
+pub use header::{Flags, Header, HeaderCounts, MessageType, Metadata};
+
+mod lower_query;
 pub use lower_query::LowerQuery;
-pub use update_message::UpdateMessage;
+
+mod message;
+pub use message::{EmitAndCount, Message, emit_message_parts};
+
+mod message_request;
+pub use message_request::{MessageRequest, Queries, QueriesEmitAndCount};
+
+mod op_code;
+pub use op_code::OpCode;
+
+mod query;
+pub use query::Query;
+
+mod response_code;
+pub use response_code::ResponseCode;
+
+mod serial_message;
+pub use serial_message::SerialMessage;
+
+pub mod update_message;
+pub use update_message::{UpdateMessage, UpdateRequest};
+
+/// Default retry interval floor.  This value is somewhat arbitrary, but is based on
+/// observed, real-world latencies and offers the chance to send three queries in a
+/// second to maximize the chance of a successful response in periods of high packet
+/// loss without overwhelming upstream servers.
+pub const DEFAULT_RETRY_FLOOR: Duration = Duration::from_millis(333);

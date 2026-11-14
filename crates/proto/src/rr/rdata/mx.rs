@@ -7,15 +7,16 @@
 
 //! mail exchange, email, record
 
-use std::fmt;
+use alloc::string::ToString;
+use core::fmt;
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::ProtoResult,
-    rr::{domain::Name, RData, RecordData, RecordType},
-    serialize::binary::*,
+    rr::{RData, RecordData, RecordType, domain::Name},
+    serialize::{binary::*, txt::ParseError},
 };
 
 /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
@@ -35,11 +36,26 @@ use crate::{
 /// [RFC-974].
 ///
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct MX {
-    preference: u16,
-    exchange: Name,
+    /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
+    ///
+    /// ```text
+    /// PREFERENCE      A 16 bit integer which specifies the preference given to
+    ///                 this RR among others at the same owner.  Lower values
+    ///                 are preferred.
+    /// ```
+    pub preference: u16,
+
+    /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
+    ///
+    /// ```text
+    /// EXCHANGE        A <domain-name> which specifies a host willing to act as
+    ///                 a mail exchange for the owner name.
+    /// ```
+    pub exchange: Name,
 }
 
 impl MX {
@@ -60,42 +76,37 @@ impl MX {
         }
     }
 
-    /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
-    ///
-    /// ```text
-    /// PREFERENCE      A 16 bit integer which specifies the preference given to
-    ///                 this RR among others at the same owner.  Lower values
-    ///                 are preferred.
-    /// ```
-    pub fn preference(&self) -> u16 {
-        self.preference
-    }
+    /// Parse the RData from a set of Tokens
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        mut tokens: I,
+        origin: Option<&Name>,
+    ) -> Result<Self, ParseError> {
+        let preference: u16 = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("preference".to_string()))
+            .and_then(|s| s.parse().map_err(Into::into))?;
+        let exchange: Name = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("exchange".to_string()))
+            .and_then(|s| Name::parse(s, origin).map_err(ParseError::from))?;
 
-    /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
-    ///
-    /// ```text
-    /// EXCHANGE        A <domain-name> which specifies a host willing to act as
-    ///                 a mail exchange for the owner name.
-    /// ```
-    pub fn exchange(&self) -> &Name {
-        &self.exchange
+        Ok(Self::new(preference, exchange))
     }
 }
 
 impl BinEncodable for MX {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        let is_canonical_names = encoder.is_canonical_names();
-        encoder.emit_u16(self.preference())?;
+        let mut encoder = encoder.with_rdata_behavior(RDataEncoding::StandardRecord);
 
-        // to_lowercase for rfc4034 and rfc6840
-        self.exchange()
-            .emit_with_lowercase(encoder, is_canonical_names)?;
+        self.preference.emit(&mut encoder)?;
+        self.exchange.emit(&mut encoder)?;
+
         Ok(())
     }
 }
 
 impl<'r> BinDecodable<'r> for MX {
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         Ok(Self::new(
             decoder.read_u16()?.unverified(/*any u16 is valid*/),
             Name::read(decoder)?,
@@ -104,13 +115,6 @@ impl<'r> BinDecodable<'r> for MX {
 }
 
 impl RecordData for MX {
-    fn try_from_rdata(data: RData) -> Result<Self, RData> {
-        match data {
-            RData::MX(csync) => Ok(csync),
-            _ => Err(data),
-        }
-    }
-
     fn try_borrow(data: &RData) -> Option<&Self> {
         match data {
             RData::MX(csync) => Some(csync),
@@ -128,7 +132,7 @@ impl RecordData for MX {
 }
 
 /// [RFC 1033](https://tools.ietf.org/html/rfc1033), DOMAIN OPERATIONS GUIDE, November 1987
-
+///
 /// ```text
 ///   MX (Mail Exchanger)  (See RFC-974 for more details.)
 ///
@@ -172,19 +176,24 @@ impl fmt::Display for MX {
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
+    use alloc::vec::Vec;
+    #[cfg(feature = "std")]
+    use std::println;
+
     use super::*;
 
     #[test]
     fn test() {
-        use std::str::FromStr;
+        use core::str::FromStr;
 
-        let rdata = MX::new(16, Name::from_str("mail.example.com").unwrap());
+        let rdata = MX::new(16, Name::from_str("mail.example.com.").unwrap());
 
         let mut bytes = Vec::new();
         let mut encoder: BinEncoder<'_> = BinEncoder::new(&mut bytes);
         assert!(rdata.emit(&mut encoder).is_ok());
         let bytes = encoder.into_bytes();
 
+        #[cfg(feature = "std")]
         println!("bytes: {bytes:?}");
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);

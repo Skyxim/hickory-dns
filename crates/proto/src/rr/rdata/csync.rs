@@ -7,18 +7,16 @@
 
 //! CSYNC record for synchronizing data from a child zone to the parent
 
-use std::fmt;
+use alloc::{collections::BTreeSet, string::ToString};
+use core::{fmt, str::FromStr};
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::*,
-    rr::{
-        type_bit_map::{decode_type_bit_maps, encode_type_bit_maps},
-        RData, RecordData, RecordDataDecodable, RecordType,
-    },
-    serialize::binary::*,
+    rr::{RData, RecordData, RecordDataDecodable, RecordType, RecordTypeSet},
+    serialize::{binary::*, txt::ParseError},
 };
 
 /// [RFC 7477, Child-to-Parent Synchronization in DNS, March 2015][rfc7477]
@@ -40,13 +38,68 @@ use crate::{
 /// ```
 ///
 /// [rfc7477]: https://tools.ietf.org/html/rfc7477
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct CSYNC {
-    soa_serial: u32,
-    immediate: bool,
-    soa_minimum: bool,
-    type_bit_maps: Vec<RecordType>,
+    /// [RFC 7477](https://datatracker.ietf.org/doc/html/rfc7477#section-2.1.1.1)
+    ///
+    /// ```text
+    /// 2.1.1.1.  The SOA Serial Field
+    ///
+    ///    The SOA Serial field contains a copy of the 32-bit SOA serial number
+    ///    from the child zone.  If the soaminimum flag is set, parental agents
+    ///    querying children's authoritative servers MUST NOT act on data from
+    ///    zones advertising an SOA serial number less than this value.  See
+    ///    [RFC1982] for properly implementing "less than" logic.  If the
+    ///    soaminimum flag is not set, parental agents MUST ignore the value in
+    ///    the SOA Serial field.  Clients can set the field to any value if the
+    ///    soaminimum flag is unset, such as the number zero.
+    ///
+    ///    Note that a child zone's current SOA serial number may be greater
+    ///    than the number indicated by the CSYNC record.  A child SHOULD update
+    ///    the SOA Serial field in the CSYNC record every time the data being
+    ///    referenced by the CSYNC record is changed (e.g., an NS record or
+    ///    associated address record is changed).  A child MAY choose to update
+    ///    the SOA Serial field to always match the current SOA Serial field.
+    ///
+    ///    Parental agents MAY cache SOA serial numbers from data they use and
+    ///    refuse to process data from zones older than the last instance from
+    ///    which they pulled data.
+    ///
+    ///    Although Section 3.2 of [RFC1982] describes how to properly implement
+    ///    a less-than comparison operation with SOA serial numbers that may
+    ///    wrap beyond the 32-bit value in both the SOA record and the CSYNC
+    ///    record, it is important that a child using the soaminimum flag must
+    ///    not increment its SOA serial number value more than 2^16 within the
+    ///    period of time that a parent might wait between polling the child for
+    ///    the CSYNC record.
+    /// ```
+    pub soa_serial: u32,
+
+    /// The immediate flag
+    pub immediate: bool,
+    /// The soaminimum flag
+    pub soa_minimum: bool,
+    /// The reserved flags
+    pub reserved_flags: u16,
+
+    /// [RFC 7477](https://tools.ietf.org/html/rfc7477#section-2.1.1.2.1), Child-to-Parent Synchronization in DNS, March 2015
+    ///
+    /// ```text
+    /// 2.1.1.2.1.  The Type Bit Map Field
+    ///
+    ///    The Type Bit Map field indicates the record types to be processed by
+    ///    the parental agent, according to the procedures in Section 3.  The
+    ///    Type Bit Map field is encoded in the same way as the Type Bit Map
+    ///    field of the NSEC record, described in [RFC4034], Section 4.1.2.  If
+    ///    a bit has been set that a parental agent implementation does not
+    ///    understand, the parental agent MUST NOT act upon the record.
+    ///    Specifically, a parental agent must not simply copy the data, and it
+    ///    must understand the semantics associated with a bit in the Type Bit
+    ///    Map field that has been set to 1.
+    /// ```
+    pub type_bit_maps: RecordTypeSet,
 }
 
 impl CSYNC {
@@ -66,33 +119,46 @@ impl CSYNC {
         soa_serial: u32,
         immediate: bool,
         soa_minimum: bool,
-        type_bit_maps: Vec<RecordType>,
+        type_bit_maps: impl IntoIterator<Item = RecordType>,
     ) -> Self {
         Self {
             soa_serial,
             immediate,
             soa_minimum,
-            type_bit_maps,
+            reserved_flags: 0,
+            type_bit_maps: RecordTypeSet::new(type_bit_maps),
         }
     }
 
-    /// [RFC 7477](https://tools.ietf.org/html/rfc7477#section-2.1.1.2.1), Child-to-Parent Synchronization in DNS, March 2015
+    /// Parse the RData from a set of Tokens
     ///
     /// ```text
-    /// 2.1.1.2.1.  The Type Bit Map Field
-    ///
-    ///    The Type Bit Map field indicates the record types to be processed by
-    ///    the parental agent, according to the procedures in Section 3.  The
-    ///    Type Bit Map field is encoded in the same way as the Type Bit Map
-    ///    field of the NSEC record, described in [RFC4034], Section 4.1.2.  If
-    ///    a bit has been set that a parental agent implementation does not
-    ///    understand, the parental agent MUST NOT act upon the record.
-    ///    Specifically, a parental agent must not simply copy the data, and it
-    ///    must understand the semantics associated with a bit in the Type Bit
-    ///    Map field that has been set to 1.
+    /// IN CSYNC 1 3 A NS AAAA
+    /// IN CSYNC 66 0 MX
     /// ```
-    pub fn type_bit_maps(&self) -> &[RecordType] {
-        &self.type_bit_maps
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        mut tokens: I,
+    ) -> Result<Self, ParseError> {
+        let soa_serial: u32 = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("soa_serial".to_string()))
+            .and_then(|s| s.parse().map_err(Into::into))?;
+
+        let flags: u16 = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("flags".to_string()))
+            .and_then(|s| s.parse().map_err(Into::into))?;
+
+        let immediate: bool = flags & 0b0000_0001 == 0b0000_0001;
+        let soa_minimum: bool = flags & 0b0000_0010 == 0b0000_0010;
+
+        let mut record_types = BTreeSet::new();
+
+        for token in tokens {
+            record_types.insert(RecordType::from_str(&token.to_uppercase())?);
+        }
+
+        Ok(Self::new(soa_serial, immediate, soa_minimum, record_types))
     }
 
     /// [RFC 7477](https://tools.ietf.org/html/rfc7477#section-2.1.1.2), Child-to-Parent Synchronization in DNS, March 2015
@@ -117,7 +183,7 @@ impl CSYNC {
     ///    flag that is unknown to or unsupported by the parental agent.
     /// ```
     pub fn flags(&self) -> u16 {
-        let mut flags: u16 = 0;
+        let mut flags = self.reserved_flags & 0b1111_1111_1111_1100;
         if self.immediate {
             flags |= 0b0000_0001
         };
@@ -130,46 +196,39 @@ impl CSYNC {
 
 impl BinEncodable for CSYNC {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u32(self.soa_serial)?;
-        encoder.emit_u16(self.flags())?;
-        encode_type_bit_maps(encoder, self.type_bit_maps())?;
+        self.soa_serial.emit(encoder)?;
+        self.flags().emit(encoder)?;
+        self.type_bit_maps.emit(encoder)?;
 
         Ok(())
     }
 }
 
 impl<'r> RecordDataDecodable<'r> for CSYNC {
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self> {
-        let start_idx = decoder.index();
-
+    fn read_data(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let soa_serial = decoder.read_u32()?.unverified();
 
         let flags: u16 = decoder
             .read_u16()?
             .verify_unwrap(|flags| flags & 0b1111_1100 == 0)
-            .map_err(|flags| ProtoError::from(ProtoErrorKind::UnrecognizedCsyncFlags(flags)))?;
+            .map_err(DecodeError::UnrecognizedCsyncFlags)?;
 
         let immediate: bool = flags & 0b0000_0001 == 0b0000_0001;
         let soa_minimum: bool = flags & 0b0000_0010 == 0b0000_0010;
+        let reserved_flags = flags & 0b1111_1111_1111_1100;
+        let type_bit_maps = RecordTypeSet::read_data(decoder)?;
 
-        let bit_map_len = length
-            .map(|u| u as usize)
-            .checked_sub(decoder.index() - start_idx)
-            .map_err(|_| ProtoError::from("invalid rdata length in CSYNC"))?;
-        let record_types = decode_type_bit_maps(decoder, bit_map_len)?;
-
-        Ok(Self::new(soa_serial, immediate, soa_minimum, record_types))
+        Ok(Self {
+            soa_serial,
+            immediate,
+            soa_minimum,
+            reserved_flags,
+            type_bit_maps,
+        })
     }
 }
 
 impl RecordData for CSYNC {
-    fn try_from_rdata(data: RData) -> Result<Self, RData> {
-        match data {
-            RData::CSYNC(csync) => Ok(csync),
-            _ => Err(data),
-        }
-    }
-
     fn try_borrow(data: &RData) -> Option<&Self> {
         match data {
             RData::CSYNC(csync) => Some(csync),
@@ -191,11 +250,11 @@ impl fmt::Display for CSYNC {
         write!(
             f,
             "{soa_serial} {flags}",
-            soa_serial = &self.soa_serial,
-            flags = &self.flags(),
+            soa_serial = self.soa_serial,
+            flags = self.flags(),
         )?;
 
-        for ty in &self.type_bit_maps {
+        for ty in self.type_bit_maps.iter() {
             write!(f, " {ty}")?;
         }
 
@@ -207,11 +266,16 @@ impl fmt::Display for CSYNC {
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
+    #[cfg(feature = "std")]
+    use std::println;
+
+    use alloc::vec::Vec;
+
     use super::*;
 
     #[test]
     fn test() {
-        let types = vec![RecordType::A, RecordType::NS, RecordType::AAAA];
+        let types = [RecordType::A, RecordType::NS, RecordType::AAAA];
 
         let rdata = CSYNC::new(123, true, true, types);
 
@@ -220,11 +284,35 @@ mod tests {
         assert!(rdata.emit(&mut encoder).is_ok());
         let bytes = encoder.into_bytes();
 
+        #[cfg(feature = "std")]
         println!("bytes: {bytes:?}");
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
-        let restrict = Restrict::new(bytes.len() as u16);
-        let read_rdata = CSYNC::read_data(&mut decoder, restrict).expect("Decoding error");
+        let read_rdata = CSYNC::read_data(&mut decoder).expect("Decoding error");
         assert_eq!(rdata, read_rdata);
+    }
+
+    #[test]
+    fn test_parsing() {
+        // IN CSYNC 123 3 NS
+        assert_eq!(
+            CSYNC::from_tokens(vec!["123", "3", "NS"].into_iter()).expect("failed to parse CSYNC"),
+            CSYNC::new(123, true, true, [RecordType::NS]),
+        );
+    }
+
+    #[test]
+    fn test_parsing_fails() {
+        // IN CSYNC NS
+        assert!(CSYNC::from_tokens(vec!["NS"].into_iter()).is_err());
+        assert!(CSYNC::from_tokens(vec![].into_iter()).is_err());
+    }
+
+    #[test]
+    fn lowercase_type() {
+        assert!(matches!(
+            CSYNC::from_tokens(vec!["1", "1", "p"].into_iter()).unwrap_err(),
+            ParseError::Proto(ProtoError::Decode(DecodeError::UnknownRecordTypeStr(_))),
+        ));
     }
 }

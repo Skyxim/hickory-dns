@@ -1,13 +1,13 @@
-# `dnssec-tests`
+# Conformance tests
 
-This repository contains two packages:
+This workspace contains two packages:
 
 - `dns-test`. This is a test framework (library) for testing DNS implementations.
 - `conformance-tests`. This is a collection of DNS, mainly DNSSEC, tests.
 
 ## Requirements
 
-To use the code in this repository you need:
+To use the code in this workspace you need:
 
 - a stable Rust toolchain to build the code
 - a working Docker setup that can run *Linux* containers -- the host OS does not need to be Linux 
@@ -30,19 +30,42 @@ To start a small DNS network using the `dns-test` framework run this command and
 $ cargo run --example explore
 ```
 
-By default, this will use `unbound` as the resolver. You can switch the resolver to `hickory-dns` using the `DNS_TEST_SUBJECT` environment variable:
+By default, this will use `unbound` as the resolver and forwarder, and `nsd` as the nameservers. You can switch the resolver/forwarder to `hickory-dns` using the `DNS_TEST_SUBJECT` environment variable:
 
 ``` shell
-$ DNS_TEST_SUBJECT="hickory https://github.com/hickory-dns/hickory-dns" cargo run --example explore
+$ DNS_TEST_SUBJECT="hickory https://github.com/hickory-dns/hickory-dns aws-lc-rs" cargo run --example explore
 ```
+
+You can switch the nameserver to `hickory-dns` using the `DNS_TEST_PEER` environment variable:
+
+```shell
+$ DNS_TEST_PEER="hickory https://github.com/hickory-dns/hickory-dns aws-lc-rs" cargo run --example explore
+```
+
+To use `hickory-dns` for both, set both the `DNS_TEST_PEER` and `DNS_TEST_SUBJECT` environment variables.
+
 
 ### Environment variables
 
-- `DNS_TEST_SUBJECT`. This variable controls what the `dns_test::subject` function returns. The variable can contain one of these values:
+- `DNS_TEST_SUBJECT`. This variable controls the choice of recursive resolver and forwarder. The variable can contain one of these values:
   - `unbound`
-  - `hickory $REPOSITORY`. where `$REPOSITORY` is a placeholder for git repository. Examples values for `$REPOSITORY`: `https://github.com/hickory-dns/hickory-dns`; `/home/user/git-repos/hickory-dns`. NOTE: when using a local repository, changes that have not been committed, regardless of whether they are staged or not, will **not** be included in the `hickory-dns` build.
-  
+  - `bind`
+  - `pdns`
+  - `hickory $REPOSITORY $CRYPTO_PROVIDER`. where `$REPOSITORY` is a placeholder for a git repository, and `$CRYPTO_PROVIDER` is `ring` or `aws-lc-rs`. Examples values for `$REPOSITORY`: `https://github.com/hickory-dns/hickory-dns`; `/home/user/git-repos/hickory-dns`. NOTE: when using a local repository, changes that have not been committed, regardless of whether they are staged or not, will **not** be included in the `hickory-dns` build.
+
+- `DNS_TEST_PEER`. This variable controls the choice of authoritative nameservers. The variable can contain one of these values:
+  - `unbound` (note: uses `nsd`)
+  - `bind`
+  - `pdns`
+  - `hickory $REPOSITORY $CRYPTO_PROVIDER`. where `$REPOSITORY` is a placeholder for a git repository, and `$CRYPTO_PROVIDER` is `ring` or `aws-lc-rs`. Examples values for `$REPOSITORY`: `https://github.com/hickory-dns/hickory-dns`; `/home/user/git-repos/hickory-dns`. NOTE: when using a local repository, changes that have not been committed, regardless of whether they are staged or not, will **not** be included in the `hickory-dns` build.
+
 - `DNS_TEST_VERBOSE_DOCKER_BUILD`. Setting this variable prints the output of the `docker build` invocations that the framework does to the console. This is useful to verify that image caching is working; for example if you set `DNS_TEST_SUBJECT` to a local `hickory-dns` repository then consecutively running the `explore` example and/or `conformance-tests` test suite **must** not rebuild `hickory-dns` provided that you have not *committed* any new change to the local repository.
+
+- `DNS_TEST_SKIP_DOCKER_BUILD`. Setting this variable skips running `docker build`. This should only be used if containers have been built recently.
+
+- `DNS_TEST_DOCKER_CACHE_GHA`. Setting this variable enables passing
+  `--cache-from` and `--cache-to` arguments to `docker build`, using the GitHub
+  Actions cache backend.
 
 ### Automatic clean-up
 
@@ -107,16 +130,16 @@ This is a collection of tests that check the conformance of a DNS implementation
 
 ### Running the test suite
 
-To run the conformance tests against `unbound` run:
+To run the conformance tests using `unbound` and `nsd` run:
 
 ``` console
 $ cargo test -p conformance-tests -- --include-ignored
 ```
 
-To run the conformance tests against `hickory-dns` run:
+To run the conformance tests using `hickory-dns` and `nsd` run:
 
 ``` console
-$ DNS_TEST_SUBJECT="hickory /path/to/repository" cargo test -p conformance-tests
+$ DNS_TEST_SUBJECT="hickory /path/to/repository aws-lc-rs" cargo test -p conformance-tests
 ```
 
 ### Test organization
@@ -157,11 +180,30 @@ When adding a new test to the test suite, it must pass with the `unbound` implem
 
 New tests that don't pass with the `hickory-dns` implementation must be marked as `#[ignore]`-d. The CI workflow will check that non-`#[ignore]`-d tests pass with the `hickory-dns` implementation. Additionally, the CI workflow will check that all `#[ignore]`-d tests *fail* with the `hickory-dns` implementation; this is to ensure that fixed tests get un-`#[ignore]`-d.
 
-## License
+## AppArmor workarounds
 
-Licensed under either of
+On some systems, depending on the OS, Docker installation, and installed
+packages, AppArmor may interfere with running conformance tests. Rules from
+AppArmor profiles defined on the host may be applied to syscalls made by
+processes inside Docker containers, which can interfere with normal execution
+of the tests.
 
-- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+This has been observed when Docker is installed in rootless mode on Ubuntu 24.04
+with the `bind` package installed, and on Ubuntu 26.04 with no additional
+packages.
 
-at your option.
+If this is an issue, check `dmesg` for operations that were denied by AppArmor,
+and update AppArmor profiles as needed to allow them. For example, to get tests
+working again with the Ubuntu 26.04 version of AppArmor's default profiles
+installed, create files with local overrides like the following.
+
+```
+# /etc/apparmor.d/local/tshark
+file r /etc/wireshark/*,
+signal receive peer=runc,
+```
+
+```
+# /etc/apparmor.d/local/dig
+file r /tmp/**,
+```

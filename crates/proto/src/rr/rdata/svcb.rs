@@ -8,25 +8,29 @@
 //! SVCB records, see [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460)
 #![allow(clippy::use_self)]
 
-use std::{
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::{
     cmp::{Ord, Ordering, PartialOrd},
     convert::TryFrom,
     fmt,
+    str::FromStr,
 };
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use enum_as_inner::EnumAsInner;
-
 use crate::{
-    error::{ProtoError, ProtoErrorKind, ProtoResult},
+    error::{ProtoError, ProtoResult},
     rr::{
-        rdata::{A, AAAA},
         Name, RData, RecordData, RecordDataDecodable, RecordType,
+        rdata::{A, AAAA},
     },
-    serialize::binary::{
-        BinDecodable, BinDecoder, BinEncodable, BinEncoder, Restrict, RestrictedMath,
+    serialize::{
+        binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder, DecodeError, RDataEncoding},
+        txt::{Lexer, ParseError, Token},
     },
 };
 
@@ -70,30 +74,10 @@ use crate::{
 ///   If any RRs are malformed, the client MUST reject the entire RRSet and
 ///   fall back to non-SVCB connection establishment.
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct SVCB {
-    svc_priority: u16,
-    target_name: Name,
-    svc_params: Vec<(SvcParamKey, SvcParamValue)>,
-}
-
-impl SVCB {
-    /// Create a new SVCB record from parts
-    ///
-    /// It is up to the caller to validate the data going into the record
-    pub fn new(
-        svc_priority: u16,
-        target_name: Name,
-        svc_params: Vec<(SvcParamKey, SvcParamValue)>,
-    ) -> Self {
-        Self {
-            svc_priority,
-            target_name,
-            svc_params,
-        }
-    }
-
     ///  [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-2.4.1)
     /// ```text
     /// 2.4.1.  SvcPriority
@@ -115,9 +99,7 @@ impl SVCB {
     ///   a priority level to the records before using them, to ensure uniform
     ///   load-balancing.
     /// ```
-    pub fn svc_priority(&self) -> u16 {
-        self.svc_priority
-    }
+    pub svc_priority: u16,
 
     ///  [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-2.5)
     /// ```text
@@ -148,75 +130,438 @@ impl SVCB {
     ///    svc2.example.net. 300   IN A     192.0.2.2
     ///    svc2.example.net. 300   IN AAAA  2001:db8::2
     /// ```
-    pub fn target_name(&self) -> &Name {
-        &self.target_name
-    }
+    pub target_name: Name,
 
     /// See [`SvcParamKey`] for details on each parameter
-    pub fn svc_params(&self) -> &[(SvcParamKey, SvcParamValue)] {
-        &self.svc_params
+    pub svc_params: Vec<(SvcParamKey, SvcParamValue)>,
+}
+
+impl SVCB {
+    /// Create a new SVCB record from parts
+    ///
+    /// It is up to the caller to validate the data going into the record
+    pub fn new(
+        svc_priority: u16,
+        target_name: Name,
+        svc_params: Vec<(SvcParamKey, SvcParamValue)>,
+    ) -> Self {
+        Self {
+            svc_priority,
+            target_name,
+            svc_params,
+        }
     }
+
+    /// [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-2.1)
+    ///
+    /// ```text
+    /// 2.1.  Zone file presentation format
+    ///
+    ///   The presentation format <RDATA> of the record ([RFC1035]) has the form:
+    ///
+    ///   SvcPriority TargetName SvcParams
+    ///
+    ///   The SVCB record is defined specifically within the Internet ("IN")
+    ///   Class ([RFC1035]).
+    ///
+    ///   SvcPriority is a number in the range 0-65535, TargetName is a
+    ///   <domain-name> ([RFC1035], Section 5.1), and the SvcParams are
+    ///   a whitespace-separated list, with each SvcParam consisting of a
+    ///   SvcParamKey=SvcParamValue pair or a standalone SvcParamKey.
+    ///   SvcParamKeys are registered by IANA  (Section 14.3).
+    ///
+    ///   Each SvcParamKey SHALL appear at most once in the SvcParams.  In
+    ///   presentation format, SvcParamKeys are lowercase alphanumeric
+    ///   strings.  Key names should contain 1-63 characters from the ranges
+    ///   "a"-"z", "0"-"9", and "-".  In ABNF [RFC5234],
+    ///
+    ///   alpha-lc      = %x61-7A   ;  a-z
+    ///   SvcParamKey   = 1*63(alpha-lc / DIGIT / "-")
+    ///   SvcParam      = SvcParamKey ["=" SvcParamValue]
+    ///   SvcParamValue = char-string ; See Appendix A.
+    ///   value         = *OCTET ; Value before key-specific parsing
+    ///
+    ///   The SvcParamValue is parsed using the character-string decoding
+    ///   algorithm (Appendix A), producing a value.  The value is then
+    ///   validated and converted into wire-format in a manner specific to each
+    ///   key.
+    ///
+    ///   When the optional "=" and SvcParamValue are omitted, the value is
+    ///   interpreted as empty.
+    ///
+    ///   Arbitrary keys can be represented using the unknown-key presentation
+    ///   format "keyNNNNN" where NNNNN is the numeric value of the key type
+    ///   without leading zeros. A SvcParam in this form SHALL be parsed as
+    ///   specified above, and the decoded value SHALL be used as its wire-format
+    ///   encoding.
+    ///
+    ///   For some SvcParamKeys, the value corresponds to a list or set of
+    ///   items.  Presentation formats for such keys SHOULD use a comma-
+    ///   separated list (Appendix A.1).
+    ///
+    ///   SvcParams in presentation format MAY appear in any order, but keys
+    ///   MUST NOT be repeated.
+    /// ```
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        mut tokens: I,
+    ) -> Result<Self, ParseError> {
+        // SvcPriority
+        let svc_priority: u16 = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("SvcPriority".to_string()))
+            .and_then(|s| s.parse().map_err(Into::into))?;
+
+        // svcb target
+        let target_name: Name = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("Target".to_string()))
+            .and_then(|s| Name::from_str(s).map_err(ParseError::from))?;
+
+        // Loop over all of the service parameters
+        let mut svc_params = Vec::new();
+        for token in tokens {
+            // first need to split the key and (optional) value
+            let mut key_value = token.splitn(2, '=');
+            let key = key_value
+                .next()
+                .ok_or_else(|| ParseError::MissingToken("SVCB SvcbParams missing".to_string()))?;
+
+            // get the value, and remove any quotes
+            let mut value = key_value.next();
+            if let Some(value) = value.as_mut() {
+                if *value == "\"" {
+                    return Err(ParseError::from("SVCB SvcbParams cannot be a single quote"));
+                }
+
+                if value.starts_with('"') && value.ends_with('"') {
+                    *value = &value[1..value.len() - 1];
+                }
+            }
+            svc_params.push(into_svc_param(key, value)?);
+        }
+
+        Ok(SVCB::new(svc_priority, target_name, svc_params))
+    }
+}
+
+// first take the param and convert to
+fn into_svc_param(
+    key: &str,
+    value: Option<&str>,
+) -> Result<(SvcParamKey, SvcParamValue), ParseError> {
+    let key = SvcParamKey::from_str(key)?;
+    let value = parse_value(key, value)?;
+
+    Ok((key, value))
+}
+
+fn parse_value(key: SvcParamKey, value: Option<&str>) -> Result<SvcParamValue, ParseError> {
+    match key {
+        SvcParamKey::Mandatory => parse_mandatory(value),
+        SvcParamKey::Alpn => parse_alpn(value),
+        SvcParamKey::NoDefaultAlpn => parse_no_default_alpn(value),
+        SvcParamKey::Port => parse_port(value),
+        SvcParamKey::Ipv4Hint => parse_ipv4_hint(value),
+        SvcParamKey::Ipv6Hint => parse_ipv6_hint(value),
+        SvcParamKey::EchConfigList => parse_ech_config(value),
+        SvcParamKey::Key(_) => parse_unknown(value),
+        SvcParamKey::Key65535 | SvcParamKey::Unknown(_) => Err(ParseError::from(
+            "Bad Key type or unsupported, see generic key option, e.g. key1234",
+        )),
+    }
+}
+
+fn parse_char_data(value: &str) -> Result<String, ParseError> {
+    let mut lex = Lexer::new(value);
+    let ch_data = lex
+        .next_token()?
+        .ok_or_else(|| ParseError::from("expected character data"))?;
+
+    match ch_data {
+        Token::CharData(data) => Ok(data),
+        _ => Err(ParseError::from("expected character data")),
+    }
+}
+
+/// [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-8)
+///
+/// ```text
+///   The presentation value SHALL be a comma-separated list
+///   (Appendix A.1) of one or more valid SvcParamKeys, either by their
+///   registered name or in the unknown-key format (Section 2.1).  Keys MAY
+///   appear in any order, but MUST NOT appear more than once.  For self-
+///   consistency (Section 2.4.3), listed keys MUST also appear in the
+///   SvcParams.
+///
+///   To enable simpler parsing, this SvcParamValue MUST NOT contain escape
+///   sequences.
+///
+///   For example, the following is a valid list of SvcParams:
+///
+///   ipv6hint=... key65333=ex1 key65444=ex2 mandatory=key65444,ipv6hint
+/// ```
+///
+/// Currently this does not validate that the mandatory section matches the other keys
+fn parse_mandatory(value: Option<&str>) -> Result<SvcParamValue, ParseError> {
+    let value = value.ok_or_else(|| ParseError::from("expected at least one Mandatory field"))?;
+
+    let mandatories = parse_list::<SvcParamKey>(value)?;
+    Ok(SvcParamValue::Mandatory(Mandatory(mandatories)))
+}
+
+/// [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-7.1.1)
+///
+/// ```text
+///   ALPNs are identified by their registered "Identification Sequence"
+///   (alpn-id), which is a sequence of 1-255 octets.
+///
+///   alpn-id = 1*255OCTET
+///
+///   For "alpn", the presentation value SHALL be a comma-separated list
+///   (Appendix A.1) of one or more alpn-ids.
+/// ```
+///
+/// This does not currently check to see if the ALPN code is legitimate
+fn parse_alpn(value: Option<&str>) -> Result<SvcParamValue, ParseError> {
+    let value = value.ok_or_else(|| ParseError::from("expected at least one ALPN code"))?;
+
+    let alpns = parse_list::<String>(value)?;
+    Ok(SvcParamValue::Alpn(Alpn(
+        alpns.into_iter().map(|alpn| alpn.into_bytes()).collect(),
+    )))
+}
+
+/// [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-7.1.1)
+///
+/// ```text
+///   For "no-default-alpn", the presentation and wire format values MUST
+///   be empty.  When "no-default-alpn" is specified in an RR, "alpn" must
+///   also be specified in order for the RR to be "self-consistent"
+///   (Section 2.4.3).
+/// ```
+fn parse_no_default_alpn(value: Option<&str>) -> Result<SvcParamValue, ParseError> {
+    if value.is_some() {
+        return Err(ParseError::from("no value expected for NoDefaultAlpn"));
+    }
+
+    Ok(SvcParamValue::NoDefaultAlpn)
+}
+
+/// [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-7.2)
+///
+/// ```text
+///   The presentation value of the SvcParamValue is a single decimal
+///   integer between 0 and 65535 in ASCII.  Any other value (e.g. an
+///   empty value) is a syntax error.  To enable simpler parsing, this
+///   SvcParam MUST NOT contain escape sequences.
+/// ```
+fn parse_port(value: Option<&str>) -> Result<SvcParamValue, ParseError> {
+    let value = value.ok_or_else(|| ParseError::from("a port number for the port option"))?;
+
+    let value = parse_char_data(value)?;
+    let port = u16::from_str(&value)?;
+    Ok(SvcParamValue::Port(port))
+}
+
+/// [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-7.3)
+///
+/// ```text
+///   The presentation value SHALL be a comma-separated list
+///   (Appendix A.1) of one or more IP addresses of the appropriate family
+///   in standard textual format [RFC5952].  To enable simpler parsing,
+///   this SvcParamValue MUST NOT contain escape sequences.
+/// ```
+fn parse_ipv4_hint(value: Option<&str>) -> Result<SvcParamValue, ParseError> {
+    let value = value.ok_or_else(|| ParseError::from("expected at least one ipv4 hint"))?;
+
+    let hints = parse_list::<A>(value)?;
+    if hints.is_empty() {
+        return Err(DecodeError::SvcParamMissingValue.into());
+    }
+    Ok(SvcParamValue::Ipv4Hint(IpHint(hints)))
+}
+
+/// [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-7.3)
+///
+/// ```text
+///   The presentation value SHALL be a comma-separated list
+///   (Appendix A.1) of one or more IP addresses of the appropriate family
+///   in standard textual format [RFC5952].  To enable simpler parsing,
+///   this SvcParamValue MUST NOT contain escape sequences.
+/// ```
+fn parse_ipv6_hint(value: Option<&str>) -> Result<SvcParamValue, ParseError> {
+    let value = value.ok_or_else(|| ParseError::from("expected at least one ipv6 hint"))?;
+
+    let hints = parse_list::<AAAA>(value)?;
+    if hints.is_empty() {
+        return Err(DecodeError::SvcParamMissingValue.into());
+    }
+    Ok(SvcParamValue::Ipv6Hint(IpHint(hints)))
+}
+
+/// As the documentation states, the presentation format (what this function outputs) must be a BASE64 encoded string.
+///   hickory-dns will encode to BASE64 during formatting of the internal data, and output the BASE64 value.
+///
+/// [draft-ietf-tls-svcb-ech-01 Bootstrapping TLS Encrypted ClientHello with DNS Service Bindings, Sep 2024](https://datatracker.ietf.org/doc/html/draft-ietf-tls-svcb-ech-01)
+/// ```text
+///  In presentation format, the value is the ECHConfigList in Base 64 Encoding
+///  (Section 4 of [RFC4648]). Base 64 is used here to simplify integration with
+///  TLS server software. To enable simpler parsing, this SvcParam MUST NOT
+///  contain escape sequences.
+/// ```
+fn parse_ech_config(value: Option<&str>) -> Result<SvcParamValue, ParseError> {
+    let value =
+        value.ok_or_else(|| ParseError::from("expected a base64 encoded string for EchConfig"))?;
+
+    let value = parse_char_data(value)?;
+    let ech_config_bytes = data_encoding::BASE64.decode(value.as_bytes())?;
+    Ok(SvcParamValue::EchConfigList(EchConfigList(
+        ech_config_bytes,
+    )))
+}
+
+///  [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-2.1)
+///
+/// ```text
+///   Arbitrary keys can be represented using the unknown-key presentation
+///   format "keyNNNNN" where NNNNN is the numeric value of the key type
+///   without leading zeros. A SvcParam in this form SHALL be parsed as specified
+///   above, and the decoded value SHALL be used as its wire-format encoding.
+///
+///   For some SvcParamKeys, the value corresponds to a list or set of
+///   items.  Presentation formats for such keys SHOULD use a comma-
+///   separated list (Appendix A.1).
+///
+///   SvcParams in presentation format MAY appear in any order, but keys
+///   MUST NOT be repeated.
+/// ```
+fn parse_unknown(value: Option<&str>) -> Result<SvcParamValue, ParseError> {
+    let unknown: Vec<u8> = if let Some(value) = value {
+        value.as_bytes().to_vec()
+    } else {
+        Vec::new()
+    };
+
+    Ok(SvcParamValue::Unknown(Unknown(unknown)))
+}
+
+fn parse_list<T>(value: &str) -> Result<Vec<T>, ParseError>
+where
+    T: FromStr,
+    T::Err: Into<ParseError>,
+{
+    let mut result = Vec::new();
+    let mut current_value = String::new();
+    let mut escaping = false;
+
+    for c in value.chars() {
+        match (c, escaping) {
+            // End of value
+            (',', false) => {
+                result.push(T::from_str(&parse_char_data(&current_value)?).map_err(Into::into)?);
+                current_value.clear()
+            }
+            // Start of escape sequence
+            ('\\', false) => escaping = true,
+            // Comma inside escape sequence
+            (',', true) => {
+                current_value.push(',');
+                escaping = false
+            }
+            // Regular character inside escape sequence
+            (_, true) => {
+                current_value.push(c);
+                escaping = false
+            }
+            // Regular character
+            (_, false) => current_value.push(c),
+        }
+    }
+
+    // Push the remaining value if there's any
+    if !current_value.is_empty() {
+        result.push(T::from_str(&parse_char_data(&current_value)?).map_err(Into::into)?);
+    }
+
+    Ok(result)
 }
 
 ///  [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-14.3.2)
 ///
 /// ```text
-/// 14.3.2.  Initial contents
+/// 14.3.2.  Initial Contents
 ///
-///   The "Service Binding (SVCB) Parameter Registry" shall initially be
-///   populated with the registrations below:
+///    The "Service Parameter Keys (SvcParamKeys)" registry has been
+///    populated with the following initial registrations:
 ///
-///   +=============+=================+======================+===========+
-///   | Number      | Name            | Meaning              | Reference |
-///   +=============+=================+======================+===========+
-///   | 0           | mandatory       | Mandatory keys in    | (This     |
-///   |             |                 | this RR              | document) |
-///   +-------------+-----------------+----------------------+-----------+
-///   | 1           | alpn            | Additional supported | (This     |
-///   |             |                 | protocols            | document) |
-///   +-------------+-----------------+----------------------+-----------+
-///   | 2           | no-default-alpn | No support for       | (This     |
-///   |             |                 | default protocol     | document) |
-///   +-------------+-----------------+----------------------+-----------+
-///   | 3           | port            | Port for alternative | (This     |
-///   |             |                 | endpoint             | document) |
-///   +-------------+-----------------+----------------------+-----------+
-///   | 4           | ipv4hint        | IPv4 address hints   | (This     |
-///   |             |                 |                      | document) |
-///   +-------------+-----------------+----------------------+-----------+
-///   | 5           | ech             | RESERVED (held for   | N/A       |
-///   |             |                 | ECH)                 |           |
-///   +-------------+-----------------+----------------------+-----------+
-///   | 6           | ipv6hint        | IPv6 address hints   | (This     |
-///   |             |                 |                      | document) |
-///   +-------------+-----------------+----------------------+-----------+
-///   | 65280-65534 | N/A             | Private Use          | (This     |
-///   |             |                 |                      | document) |
-///   +-------------+-----------------+----------------------+-----------+
-///   | 65535       | N/A             | Reserved ("Invalid   | (This     |
-///   |             |                 | key")                | document) |
-///   +-------------+-----------------+----------------------+-----------+
+///    +===========+=================+================+=========+==========+
+///    |   Number  | Name            | Meaning        |Reference|Change    |
+///    |           |                 |                |         |Controller|
+///    +===========+=================+================+=========+==========+
+///    |     0     | mandatory       | Mandatory      |RFC 9460,|IETF      |
+///    |           |                 | keys in this   |Section 8|          |
+///    |           |                 | RR             |         |          |
+///    +-----------+-----------------+----------------+---------+----------+
+///    |     1     | alpn            | Additional     |RFC 9460,|IETF      |
+///    |           |                 | supported      |Section  |          |
+///    |           |                 | protocols      |7.1      |          |
+///    +-----------+-----------------+----------------+---------+----------+
+///    |     2     | no-default-alpn | No support     |RFC 9460,|IETF      |
+///    |           |                 | for default    |Section  |          |
+///    |           |                 | protocol       |7.1      |          |
+///    +-----------+-----------------+----------------+---------+----------+
+///    |     3     | port            | Port for       |RFC 9460,|IETF      |
+///    |           |                 | alternative    |Section  |          |
+///    |           |                 | endpoint       |7.2      |          |
+///    +-----------+-----------------+----------------+---------+----------+
+///    |     4     | ipv4hint        | IPv4 address   |RFC 9460,|IETF      |
+///    |           |                 | hints          |Section  |          |
+///    |           |                 |                |7.3      |          |
+///    +-----------+-----------------+----------------+---------+----------+
+///    |     5     | ech             | RESERVED       |N/A      |IETF      |
+///    |           |                 | (held for      |         |          |
+///    |           |                 | Encrypted      |         |          |
+///    |           |                 | ClientHello)   |         |          |
+///    +-----------+-----------------+----------------+---------+----------+
+///    |     6     | ipv6hint        | IPv6 address   |RFC 9460,|IETF      |
+///    |           |                 | hints          |Section  |          |
+///    |           |                 |                |7.3      |          |
+///    +-----------+-----------------+----------------+---------+----------+
+///    |65280-65534| N/A             | Reserved for   |RFC 9460 |IETF      |
+///    |           |                 | Private Use    |         |          |
+///    +-----------+-----------------+----------------+---------+----------+
+///    |   65535   | N/A             | Reserved       |RFC 9460 |IETF      |
+///    |           |                 | ("Invalid      |         |          |
+///    |           |                 | key")          |         |          |
+///    +-----------+-----------------+----------------+---------+----------+
 ///
 /// parsing done via:
 ///   *  a 2 octet field containing the SvcParamKey as an integer in
 ///      network byte order.  (See Section 14.3.2 for the defined values.)
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum SvcParamKey {
     /// Mandatory keys in this RR
+    #[cfg_attr(feature = "serde", serde(rename = "mandatory"))]
     Mandatory,
     /// Additional supported protocols
+    #[cfg_attr(feature = "serde", serde(rename = "alpn"))]
     Alpn,
     /// No support for default protocol
+    #[cfg_attr(feature = "serde", serde(rename = "no-default-alpn"))]
     NoDefaultAlpn,
     /// Port for alternative endpoint
+    #[cfg_attr(feature = "serde", serde(rename = "port"))]
     Port,
     /// IPv4 address hints
+    #[cfg_attr(feature = "serde", serde(rename = "ipv4hint"))]
     Ipv4Hint,
     /// Encrypted Client Hello configuration list
+    #[cfg_attr(feature = "serde", serde(rename = "ech"))]
     EchConfigList,
     /// IPv6 address hints
+    #[cfg_attr(feature = "serde", serde(rename = "ipv6hint"))]
     Ipv6Hint,
     /// Private Use
     Key(u16),
@@ -263,7 +608,7 @@ impl From<SvcParamKey> for u16 {
 impl<'r> BinDecodable<'r> for SvcParamKey {
     // a 2 octet field containing the SvcParamKey as an integer in
     //      network byte order.  (See Section 14.3.2 for the defined values.)
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         Ok(decoder.read_u16()?.unverified(/*any u16 is valid*/).into())
     }
 }
@@ -272,13 +617,13 @@ impl BinEncodable for SvcParamKey {
     // a 2 octet field containing the SvcParamKey as an integer in
     //      network byte order.  (See Section 14.3.2 for the defined values.)
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u16((*self).into())
+        u16::from(*self).emit(encoder)
     }
 }
 
 impl fmt::Display for SvcParamKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        match *self {
+        match self {
             Self::Mandatory => f.write_str("mandatory")?,
             Self::Alpn => f.write_str("alpn")?,
             Self::NoDefaultAlpn => f.write_str("no-default-alpn")?,
@@ -295,16 +640,14 @@ impl fmt::Display for SvcParamKey {
     }
 }
 
-impl std::str::FromStr for SvcParamKey {
+impl FromStr for SvcParamKey {
     type Err = ProtoError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         /// keys are in the format of key#, e.g. key12344, with a max value of u16
         fn parse_unknown_key(key: &str) -> Result<SvcParamKey, ProtoError> {
             let key_value = key.strip_prefix("key").ok_or_else(|| {
-                ProtoError::from(ProtoErrorKind::Msg(format!(
-                    "bad formatted key ({key}), expected key1234"
-                )))
+                ProtoError::from(format!("bad formatted key ({key}), expected key1234"))
             })?;
 
             Ok(SvcParamKey::Key(u16::from_str(key_value)?))
@@ -347,8 +690,8 @@ impl PartialOrd for SvcParamKey {
 ///   *  an octet string of this length whose contents are in a format
 ///      determined by the SvcParamKey.
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, EnumAsInner)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum SvcParamValue {
     ///    In a ServiceMode RR, a SvcParamKey is considered "mandatory" if the
     ///    RR will not function correctly for clients that ignore this
@@ -359,6 +702,7 @@ pub enum SvcParamValue {
     ///    mandatory keys that are present.
     ///
     /// see `Mandatory`
+    #[cfg_attr(feature = "serde", serde(rename = "mandatory"))]
     Mandatory(Mandatory),
     ///  [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-7.1)
     ///
@@ -368,10 +712,12 @@ pub enum SvcParamValue {
     ///    identifiers [Alpn] and associated transport protocols supported by
     ///    this service endpoint (the "SVCB ALPN set").
     /// ```
+    #[cfg_attr(feature = "serde", serde(rename = "alpn"))]
     Alpn(Alpn),
     /// For "no-default-alpn", the presentation and wire format values MUST
     ///    be empty.
     /// See also `Alpn`
+    #[cfg_attr(feature = "serde", serde(rename = "no-default-alpn"))]
     NoDefaultAlpn,
     ///  [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-7.2)
     ///
@@ -395,6 +741,7 @@ pub enum SvcParamValue {
     ///   client to lose access to the service, so operators should exercise
     ///   caution when using this SvcParamKey to specify a non-default port.
     /// ```
+    #[cfg_attr(feature = "serde", serde(rename = "port"))]
     Port(u16),
     ///  [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-7.2)
     ///
@@ -410,6 +757,7 @@ pub enum SvcParamValue {
     ///   or other geo-aware features and thereby degrade client performance.
     ///
     /// see `IpHint`
+    #[cfg_attr(feature = "serde", serde(rename = "ipv4hint"))]
     Ipv4Hint(IpHint<A>),
     /// [draft-ietf-tls-svcb-ech-01 Bootstrapping TLS Encrypted ClientHello with DNS Service Bindings, Sep 2024](https://datatracker.ietf.org/doc/html/draft-ietf-tls-svcb-ech-01)
     ///
@@ -421,8 +769,10 @@ pub enum SvcParamValue {
     ///   (including DTLS [RFC9147] and QUIC version 1 [RFC9001]) unless otherwise
     ///   specified.
     /// ```
+    #[cfg_attr(feature = "serde", serde(rename = "ech"))]
     EchConfigList(EchConfigList),
     /// See `IpHint`
+    #[cfg_attr(feature = "serde", serde(rename = "ipv6hint"))]
     Ipv6Hint(IpHint<AAAA>),
     /// Unparsed network data. Refer to documents on the associated key value
     ///
@@ -435,17 +785,14 @@ impl SvcParamValue {
     // a 2 octet field containing the length of the SvcParamValue as an
     //      integer between 0 and 65535 in network byte order (but constrained
     //      by the RDATA and DNS message sizes).
-    fn read(key: SvcParamKey, decoder: &mut BinDecoder<'_>) -> ProtoResult<Self> {
+    fn read(key: SvcParamKey, decoder: &mut BinDecoder<'_>) -> Result<Self, DecodeError> {
         let len: usize = decoder
             .read_u16()?
             .verify_unwrap(|len| *len as usize <= decoder.len())
             .map(|len| len as usize)
-            .map_err(|u| {
-                ProtoError::from(format!(
-                    "length of SvcParamValue ({}) exceeds remainder in RDATA ({})",
-                    u,
-                    decoder.len()
-                ))
+            .map_err(|u| DecodeError::IncorrectRDataLengthRead {
+                read: decoder.len(),
+                len: u as usize,
             })?;
 
         let param_data = decoder.read_slice(len)?.unverified(/*verification to be done by individual param types*/);
@@ -457,7 +804,7 @@ impl SvcParamValue {
             // should always be empty
             SvcParamKey::NoDefaultAlpn => {
                 if len > 0 {
-                    return Err(ProtoError::from("Alpn expects at least one value"));
+                    return Err(DecodeError::IncorrectRDataLengthRead { read: len, len: 0 });
                 }
 
                 Self::NoDefaultAlpn
@@ -476,6 +823,10 @@ impl SvcParamValue {
             }
         };
 
+        if !decoder.is_empty() {
+            return Err(DecodeError::ExtraData);
+        }
+
         Ok(value)
     }
 }
@@ -492,7 +843,7 @@ impl BinEncodable for SvcParamValue {
             Self::Mandatory(mandatory) => mandatory.emit(encoder)?,
             Self::Alpn(alpn) => alpn.emit(encoder)?,
             Self::NoDefaultAlpn => (),
-            Self::Port(port) => encoder.emit_u16(*port)?,
+            Self::Port(port) => port.emit(encoder)?,
             Self::Ipv4Hint(ip_hint) => ip_hint.emit(encoder)?,
             Self::EchConfigList(ech_config) => ech_config.emit(encoder)?,
             Self::Ipv6Hint(ip_hint) => ip_hint.emit(encoder)?,
@@ -565,7 +916,7 @@ impl fmt::Display for SvcParamValue {
 ///    SHOULD NOT appear in the list either.  (Including them wastes space
 ///    and otherwise has no effect.)
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 #[repr(transparent)]
 pub struct Mandatory(pub Vec<SvcParamKey>);
@@ -578,7 +929,7 @@ impl<'r> BinDecodable<'r> for Mandatory {
     ///    In wire format, the keys are represented by their numeric values in
     ///    network byte order, concatenated in strictly increasing numeric order.
     /// ```
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let mut keys = Vec::with_capacity(1);
 
         while decoder.peek().is_some() {
@@ -586,7 +937,7 @@ impl<'r> BinDecodable<'r> for Mandatory {
         }
 
         if keys.is_empty() {
-            return Err(ProtoError::from("Mandatory expects at least one value"));
+            return Err(DecodeError::SvcParamMissingValue);
         }
 
         Ok(Self(keys))
@@ -644,62 +995,68 @@ impl fmt::Display for Mandatory {
 ///  [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-7.1)
 ///
 /// ```text
-/// 6.1.  "alpn" and "no-default-alpn"
+/// 7.1.  "alpn" and "no-default-alpn"
 ///
 ///   The "alpn" and "no-default-alpn" SvcParamKeys together indicate the
-///   set of Application Layer Protocol Negotiation (ALPN) protocol
+///   set of Application-Layer Protocol Negotiation (ALPN) protocol
 ///   identifiers [ALPN] and associated transport protocols supported by
-///   this service endpoint.
+///   this service endpoint (the "SVCB ALPN set").
 ///
-///   As with Alt-Svc [AltSvc], the ALPN protocol identifier is used to
+///   As with Alt-Svc [AltSvc], each ALPN protocol identifier is used to
 ///   identify the application protocol and associated suite of protocols
-///   supported by the endpoint (the "protocol suite"). The presence of an
+///   supported by the endpoint (the "protocol suite").  The presence of an
 ///   ALPN protocol identifier in the SVCB ALPN set indicates that this
 ///   service endpoint, described by TargetName and the other parameters
 ///   (e.g., "port"), offers service with the protocol suite associated
-///   with this ALPN identifier.  
+///   with this ALPN identifier.
 ///
-///   Clients filter the set of ALPN identifiers to match the protocol suites
-///   they support, and this informs the underlying transport protocol used
-///   (such as QUIC over UDP or TLS over TCP). ALPN protocol identifiers that do
-///   not uniquely identify a protocol suite (e.g., an Identification Sequence
-///   that can be used with both TLS and DTLS) are not compatible with this
-///   SvcParamKey and MUST NOT be included in the SVCB ALPN set.
+///   Clients filter the set of ALPN identifiers to match the protocol
+///   suites they support, and this informs the underlying transport
+///   protocol used (such as QUIC over UDP or TLS over TCP).  ALPN protocol
+///   identifiers that do not uniquely identify a protocol suite (e.g., an
+///   Identification Sequence that can be used with both TLS and DTLS) are
+///   not compatible with this SvcParamKey and MUST NOT be included in the
+///   SVCB ALPN set.
+///
+/// 7.1.1.  Representation
 ///
 ///   ALPNs are identified by their registered "Identification Sequence"
-///   ("alpn-id"), which is a sequence of 1-255 octets.
+///   (alpn-id), which is a sequence of 1-255 octets.
 ///
 ///   alpn-id = 1*255OCTET
 ///
 ///   For "alpn", the presentation value SHALL be a comma-separated list
-///   (Appendix A.1) of one or more alpn-ids. Zone-file implementations MAY
-///   disallow the "," and "\" characters in ALPN IDs instead of implementing
-///   the value-list escaping procedure, relying on the opaque key format
-///   (e.g., key1=\002h2) in the event that these characters are needed.
+///   (Appendix A.1) of one or more alpn-ids.  Zone-file implementations
+///   MAY disallow the "," and "\" characters in ALPN IDs instead of
+///   implementing the value-list escaping procedure, relying on the opaque
+///   key format (e.g., key1=\002h2) in the event that these characters are
+///   needed.
 ///
-///   The wire format value for "alpn" consists of at least one "alpn-id"
+///   The wire-format value for "alpn" consists of at least one alpn-id
 ///   prefixed by its length as a single octet, and these length-value
 ///   pairs are concatenated to form the SvcParamValue.  These pairs MUST
 ///   exactly fill the SvcParamValue; otherwise, the SvcParamValue is
 ///   malformed.
 ///
-///   For "no-default-alpn", the presentation and wire format values MUST
+///   For "no-default-alpn", the presentation and wire-format values MUST
 ///   be empty.  When "no-default-alpn" is specified in an RR, "alpn" must
 ///   also be specified in order for the RR to be "self-consistent"
 ///   (Section 2.4.3).
 ///
-///   Each scheme that uses this SvcParamKey defines a "default set" of ALPN
-///   IDs that are supported by nearly all clients and servers; this set MAY
-///   be empty. To determine the SVCB ALPN set, the client starts with the
-///   list of alpn-ids from the "alpn" SvcParamKey, and it adds the default
-///   set unless the "no-default-alpn" SvcParamKey is present.
+///   Each scheme that uses this SvcParamKey defines a "default set" of
+///   ALPN IDs that are supported by nearly all clients and servers; this
+///   set MAY be empty.  To determine the SVCB ALPN set, the client starts
+///   with the list of alpn-ids from the "alpn" SvcParamKey, and it adds
+///   the default set unless the "no-default-alpn" SvcParamKey is present.
+///
+/// 7.1.2.  Use
 ///
 ///   To establish a connection to the endpoint, clients MUST
 ///
 ///   1.  Let SVCB-ALPN-Intersection be the set of protocols in the SVCB
 ///       ALPN set that the client supports.
 ///
-///   2.  Let Intersection-Transports be the set of transports (e.g.  TLS,
+///   2.  Let Intersection-Transports be the set of transports (e.g., TLS,
 ///       DTLS, QUIC) implied by the protocols in SVCB-ALPN-Intersection.
 ///
 ///   3.  For each transport in Intersection-Transports, construct a
@@ -707,10 +1064,10 @@ impl fmt::Display for Mandatory {
 ///       the client's supported ALPN protocols for that transport, without
 ///       regard to the SVCB ALPN set.
 ///
-///   For example, if the SVCB ALPN set is ["http/1.1", "h3"], and the
+///   For example, if the SVCB ALPN set is ["http/1.1", "h3"] and the
 ///   client supports HTTP/1.1, HTTP/2, and HTTP/3, the client could
 ///   attempt to connect using TLS over TCP with a ProtocolNameList of
-///   ["http/1.1", "h2"], and could also attempt a connection using QUIC,
+///   ["http/1.1", "h2"] and could also attempt a connection using QUIC
 ///   with a ProtocolNameList of ["h3"].
 ///
 ///   Once the client has constructed a ClientHello, protocol negotiation
@@ -718,13 +1075,13 @@ impl fmt::Display for Mandatory {
 ///   the SVCB ALPN set.
 ///
 ///   Clients MAY implement a fallback procedure, using a less-preferred
-///   transport if more-preferred transports fail to connect. This fallback
-///   behavior is vulnerable to manipulation by a network attacker who blocks
-///   the more-preferred transports, but it may be necessary for compatibility
-///   with existing networks.
+///   transport if more-preferred transports fail to connect.  This
+///   fallback behavior is vulnerable to manipulation by a network attacker
+///   who blocks the more-preferred transports, but it may be necessary for
+///   compatibility with existing networks.
 ///
 ///   With this procedure in place, an attacker who can modify DNS and
-///   network traffic can prevent a successful transport connection, but
+///   network traffic can prevent a successful transport connection but
 ///   cannot otherwise interfere with ALPN protocol selection.  This
 ///   procedure also ensures that each ProtocolNameList includes at least
 ///   one protocol from the SVCB ALPN set.
@@ -732,42 +1089,47 @@ impl fmt::Display for Mandatory {
 ///   Clients SHOULD NOT attempt connection to a service endpoint whose
 ///   SVCB ALPN set does not contain any supported protocols.
 ///
-///   To ensure consistency of behavior, clients MAY reject the entire SVCB RRSet
-///   and fall back to basic connection establishment if all of the RRs
-///   indicate "no-default-alpn", even if connection could have succeeded
-///   using a non-default alpn.
+///   To ensure consistency of behavior, clients MAY reject the entire SVCB
+///   RRset and fall back to basic connection establishment if all of the
+///   compatible RRs indicate "no-default-alpn", even if connection could
+///   have succeeded using a non-default ALPN protocol.
 ///
-///   Zone operators SHOULD ensure that at least one RR in each RRset supports
-///   the default transports. This enables compatibility with the greatest
-///   number of clients.
+///   Zone operators SHOULD ensure that at least one RR in each RRset
+///   supports the default transports.  This enables compatibility with the
+///   greatest number of clients.
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 #[repr(transparent)]
-pub struct Alpn(pub Vec<String>);
+pub struct Alpn(pub Vec<Vec<u8>>);
 
 impl<'r> BinDecodable<'r> for Alpn {
     /// This expects the decoder to be limited to only this field, i.e. the end of input for the decoder
     ///   is the end of input for the fields
     ///
     /// ```text
-    ///   The wire format value for "alpn" consists of at least one "alpn-id"
+    ///   The wire format value for "alpn" consists of at least one alpn-id
     ///   prefixed by its length as a single octet, and these length-value
     ///   pairs are concatenated to form the SvcParamValue.  These pairs MUST
     ///   exactly fill the SvcParamValue; otherwise, the SvcParamValue is
     ///   malformed.
     /// ```
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let mut alpns = Vec::with_capacity(1);
 
         while decoder.peek().is_some() {
-            let alpn = decoder.read_character_data()?.unverified(/*will rely on string parser*/);
-            let alpn = String::from_utf8(alpn.to_vec())?;
+            let alpn = decoder
+                .read_character_data()?
+                .verify_unwrap(|id| !id.is_empty() && id.len() <= 255)
+                .map_err(|_| {
+                    DecodeError::SvcParamValueInvalid("length of alpn-id is out of bounds")
+                })?;
+            let alpn = alpn.to_vec();
             alpns.push(alpn);
         }
 
         if alpns.is_empty() {
-            return Err(ProtoError::from("Alpn expects at least one value"));
+            return Err(DecodeError::SvcParamMissingValue);
         }
 
         Ok(Self(alpns))
@@ -775,7 +1137,7 @@ impl<'r> BinDecodable<'r> for Alpn {
 }
 
 impl BinEncodable for Alpn {
-    ///   The wire format value for "alpn" consists of at least one "alpn-id"
+    ///   The wire format value for "alpn" consists of at least one alpn-id
     ///   prefixed by its length as a single octet, and these length-value
     ///   pairs are concatenated to form the SvcParamValue.  These pairs MUST
     ///   exactly fill the SvcParamValue; otherwise, the SvcParamValue is
@@ -797,9 +1159,11 @@ impl fmt::Display for Alpn {
     ///   The presentation value SHALL be a comma-separated list
     ///   (Appendix A.1) of one or more "alpn-id"s.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        for alpn in self.0.iter() {
-            // TODO: confirm in the RFC that trailing commas are ok
-            write!(f, "{alpn},")?;
+        for (i, alpn) in self.0.iter().enumerate() {
+            if i > 0 {
+                write!(f, ",")?;
+            }
+            write!(f, "{}", String::from_utf8_lossy(alpn))?;
         }
 
         Ok(())
@@ -822,7 +1186,7 @@ impl fmt::Display for Alpn {
 ///   with TLS server software. To enable simpler parsing, this SvcParam MUST NOT contain escape
 ///   sequences.
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(PartialEq, Eq, Hash, Clone)]
 #[repr(transparent)]
 pub struct EchConfigList(pub Vec<u8>);
@@ -833,9 +1197,8 @@ impl<'r> BinDecodable<'r> for EchConfigList {
     /// ECHConfigList in Base 64 Encoding (Section 4 of RFC4648).
     /// Base 64 is used here to simplify integration with TLS server software.
     /// To enable simpler parsing, this SvcParam MUST NOT contain escape sequences.
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
-        let data =
-            decoder.read_vec(decoder.len())?.unverified(/*up to consumer to validate this data*/);
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
+        let data = decoder.read_vec_to_end().unverified(/*up to consumer to validate this data*/);
 
         Ok(Self(data))
     }
@@ -848,7 +1211,7 @@ impl BinEncodable for EchConfigList {
     /// Base 64 is used here to simplify integration with TLS server software.
     /// To enable simpler parsing, this SvcParam MUST NOT contain escape sequences.
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_vec(&self.0)?;
+        encoder.emit_slice(&self.0)?;
 
         Ok(())
     }
@@ -890,41 +1253,41 @@ impl fmt::Debug for EchConfigList {
 ///   MAY use to reach the service.  If A and AAAA records for TargetName
 ///   are locally available, the client SHOULD ignore these hints.
 ///   Otherwise, clients SHOULD perform A and/or AAAA queries for
-///   TargetName as in Section 3, and clients SHOULD use the IP address in
+///   TargetName per Section 3, and clients SHOULD use the IP address in
 ///   those responses for future connections.  Clients MAY opt to terminate
 ///   any connections using the addresses in hints and instead switch to
 ///   the addresses in response to the TargetName query.  Failure to use A
 ///   and/or AAAA response addresses could negatively impact load balancing
 ///   or other geo-aware features and thereby degrade client performance.
 ///
-///   The presentation value SHALL be a comma-separated list
-///   (Appendix A.1) of one or more IP addresses of the appropriate family
-///   in standard textual format [RFC5952].  To enable simpler parsing,
-///   this SvcParamValue MUST NOT contain escape sequences.
+///   The presentation value SHALL be a comma-separated list (Appendix A.1)
+///   of one or more IP addresses of the appropriate family in standard
+///   textual format [RFC5952] [RFC4001].  To enable simpler parsing, this
+///   SvcParamValue MUST NOT contain escape sequences.
 ///
 ///   The wire format for each parameter is a sequence of IP addresses in
-///   network byte order (for the respective address family). Like an A or
-///   AAAA RRSet, the list of addresses represents an unordered collection,
+///   network byte order (for the respective address family).  Like an A or
+///   AAAA RRset, the list of addresses represents an unordered collection,
 ///   and clients SHOULD pick addresses to use in a random order.  An empty
 ///   list of addresses is invalid.
 ///
 ///   When selecting between IPv4 and IPv6 addresses to use, clients may
 ///   use an approach such as Happy Eyeballs [HappyEyeballsV2].  When only
-///   "ipv4hint" is present, NAT64 clients may synthesize IPv6 addresses
-///   as specified in [RFC7050] or ignore the "ipv4hint" key and
-///   wait for AAAA resolution (Section 3). For best performance, server
-///   operators SHOULD include an "ipv6hint" parameter whenever they
-///   include an "ipv4hint" parameter.
+///   "ipv4hint" is present, NAT64 clients may synthesize IPv6 addresses as
+///   specified in [RFC7050] or ignore the "ipv4hint" key and wait for AAAA
+///   resolution (Section 3).  For best performance, server operators
+///   SHOULD include an "ipv6hint" parameter whenever they include an
+///   "ipv4hint" parameter.
 ///
 ///   These parameters are intended to minimize additional connection
 ///   latency when a recursive resolver is not compliant with the
-///   requirements in Section 4, and SHOULD NOT be included if most clients
+///   requirements in Section 4 and SHOULD NOT be included if most clients
 ///   are using compliant recursive resolvers.  When TargetName is the
-///   origin hostname or the owner name (which can be written as "."),
-///   server operators SHOULD NOT include these hints, because they are
-///   unlikely to convey any performance benefit.
+///   service name or the owner name (which can be written as "."), server
+///   operators SHOULD NOT include these hints, because they are unlikely
+///   to convey any performance benefit.
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 #[repr(transparent)]
 pub struct IpHint<T>(pub Vec<T>);
@@ -938,11 +1301,15 @@ where
     ///   AAAA RRSet, the list of addresses represents an unordered collection,
     ///   and clients SHOULD pick addresses to use in a random order.  An empty
     ///   list of addresses is invalid.
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let mut ips = Vec::new();
 
         while decoder.peek().is_some() {
             ips.push(T::read(decoder)?)
+        }
+
+        if ips.is_empty() {
+            return Err(DecodeError::SvcParamMissingValue);
         }
 
         Ok(Self(ips))
@@ -999,19 +1366,18 @@ where
 ///   SvcParams in presentation format MAY appear in any order, but keys
 ///   MUST NOT be repeated.
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 #[repr(transparent)]
 pub struct Unknown(pub Vec<u8>);
 
 impl<'r> BinDecodable<'r> for Unknown {
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         // The passed slice is already length delimited, and we cannot
         // assume it's a collection of anything.
-        let len = decoder.len();
 
-        let data = decoder.read_vec(len)?;
-        let unknowns = data.unverified(/*any data is valid here*/).to_vec();
+        let data = decoder.read_vec_to_end();
+        let unknowns = data.unverified(/*any data is valid here*/);
 
         Ok(Self(unknowns))
     }
@@ -1019,10 +1385,7 @@ impl<'r> BinDecodable<'r> for Unknown {
 
 impl BinEncodable for Unknown {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        // draft-ietf-dnsop-svcb-https-11#appendix-A: The algorithm is the same as used by
-        // <character-string> in RFC 1035, although the output length in this
-        // document is not limited to 255 octets.
-        encoder.emit_character_data_unrestricted(&self.0)?;
+        encoder.emit_slice(&self.0)?;
 
         Ok(())
     }
@@ -1039,8 +1402,10 @@ impl fmt::Display for Unknown {
 
 impl BinEncodable for SVCB {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        self.svc_priority.emit(encoder)?;
-        self.target_name.emit(encoder)?;
+        let mut encoder = encoder.with_rdata_behavior(RDataEncoding::Other);
+
+        self.svc_priority.emit(&mut encoder)?;
+        self.target_name.emit(&mut encoder)?;
 
         let mut last_key: Option<SvcParamKey> = None;
         for (key, param) in self.svc_params.iter() {
@@ -1050,8 +1415,8 @@ impl BinEncodable for SVCB {
                 }
             }
 
-            key.emit(encoder)?;
-            param.emit(encoder)?;
+            key.emit(&mut encoder)?;
+            param.emit(&mut encoder)?;
 
             last_key = Some(*key);
         }
@@ -1060,7 +1425,7 @@ impl BinEncodable for SVCB {
     }
 }
 
-impl<'r> RecordDataDecodable<'r> for SVCB {
+impl RecordDataDecodable<'_> for SVCB {
     /// Reads the SVCB record from the decoder.
     ///
     /// [RFC 9460 SVCB and HTTPS Resource Records, Nov 2023](https://datatracker.ietf.org/doc/html/rfc9460#section-2.2)
@@ -1079,21 +1444,14 @@ impl<'r> RecordDataDecodable<'r> for SVCB {
     ///   If any RRs are malformed, the client MUST reject the entire RRSet and
     ///   fall back to non-SVCB connection establishment.
     /// ```
-    fn read_data(decoder: &mut BinDecoder<'_>, rdata_length: Restrict<u16>) -> ProtoResult<SVCB> {
-        let start_index = decoder.index();
-
+    fn read_data(decoder: &mut BinDecoder<'_>) -> Result<Self, DecodeError> {
         let svc_priority = decoder.read_u16()?.unverified(/*any u16 is valid*/);
         let target_name = Name::read(decoder)?;
 
-        let mut remainder_len = rdata_length
-            .map(|len| len as usize)
-            .checked_sub(decoder.index() - start_index)
-            .map_err(|len| format!("Bad length for RDATA of SVCB: {len}"))?
-            .unverified(); // valid len
         let mut svc_params: Vec<(SvcParamKey, SvcParamValue)> = Vec::new();
 
         // must have at least 4 bytes left for the key and the length
-        while remainder_len >= 4 {
+        while decoder.len() >= 4 {
             // a 2 octet field containing the SvcParamKey as an integer in
             //      network byte order.  (See Section 14.3.2 for the defined values.)
             let key = SvcParamKey::read(decoder)?;
@@ -1105,16 +1463,11 @@ impl<'r> RecordDataDecodable<'r> for SVCB {
 
             if let Some(last_key) = svc_params.last().map(|(key, _)| key) {
                 if last_key >= &key {
-                    return Err(ProtoError::from("SvcParams out of order"));
+                    return Err(DecodeError::SvcParamsOutOfOrder);
                 }
             }
 
             svc_params.push((key, value));
-            remainder_len = rdata_length
-                .map(|len| len as usize)
-                .checked_sub(decoder.index() - start_index)
-                .map_err(|len| format!("Bad length for RDATA of SVCB: {len}"))?
-                .unverified(); // valid len
         }
 
         Ok(Self {
@@ -1126,13 +1479,6 @@ impl<'r> RecordDataDecodable<'r> for SVCB {
 }
 
 impl RecordData for SVCB {
-    fn try_from_rdata(data: RData) -> Result<Self, RData> {
-        match data {
-            RData::SVCB(data) => Ok(data),
-            _ => Err(data),
-        }
-    }
-
     fn try_borrow(data: &RData) -> Option<&Self> {
         match data {
             RData::SVCB(data) => Some(data),
@@ -1177,6 +1523,10 @@ impl fmt::Display for SVCB {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
+    use crate::{rr::rdata::HTTPS, serialize::txt::Parser};
+
     use super::*;
 
     #[test]
@@ -1212,13 +1562,12 @@ mod tests {
     #[track_caller]
     fn test_encode_decode(rdata: SVCB) {
         let mut bytes = Vec::new();
-        let mut encoder: BinEncoder<'_> = BinEncoder::new(&mut bytes);
+        let mut encoder = BinEncoder::new(&mut bytes);
         rdata.emit(&mut encoder).expect("failed to emit SVCB");
         let bytes = encoder.into_bytes();
 
-        let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
-        let read_rdata = SVCB::read_data(&mut decoder, Restrict::new(bytes.len() as u16))
-            .expect("failed to read back");
+        let mut decoder = BinDecoder::new(bytes);
+        let read_rdata = SVCB::read_data(&mut decoder).expect("failed to read back");
         assert_eq!(rdata, read_rdata);
     }
 
@@ -1234,7 +1583,7 @@ mod tests {
             Name::from_utf8(".").unwrap(),
             vec![(
                 SvcParamKey::Alpn,
-                SvcParamValue::Alpn(Alpn(vec!["h2".to_string()])),
+                SvcParamValue::Alpn(Alpn(vec![b"h2".to_vec()])),
             )],
         ));
         test_encode_decode(SVCB::new(
@@ -1247,7 +1596,7 @@ mod tests {
                 ),
                 (
                     SvcParamKey::Alpn,
-                    SvcParamValue::Alpn(Alpn(vec!["h2".to_string()])),
+                    SvcParamValue::Alpn(Alpn(vec![b"h2".to_vec()])),
                 ),
             ],
         ));
@@ -1262,7 +1611,7 @@ mod tests {
             vec![
                 (
                     SvcParamKey::Alpn,
-                    SvcParamValue::Alpn(Alpn(vec!["h2".to_string()])),
+                    SvcParamValue::Alpn(Alpn(vec![b"h2".to_vec()])),
                 ),
                 (
                     SvcParamKey::Mandatory,
@@ -1296,4 +1645,322 @@ mod tests {
         let mut encoder = BinEncoder::new(&mut buf);
         svcb.emit(&mut encoder).unwrap();
     }
+
+    #[test]
+    fn test_unknown_value_round_trip() {
+        let svcb = SVCB::new(
+            8224,
+            Name::from_utf8(".").unwrap(),
+            vec![(
+                SvcParamKey::Unknown(8224),
+                SvcParamValue::Unknown(Unknown(vec![32; 10])),
+            )],
+        );
+
+        let mut buf = Vec::new();
+        let mut encoder = BinEncoder::new(&mut buf);
+        svcb.emit(&mut encoder).unwrap();
+
+        let mut decoder = BinDecoder::new(&buf);
+        let decoded = SVCB::read_data(&mut decoder).unwrap();
+
+        assert_eq!(svcb, decoded);
+    }
+
+    // this assumes that only a single record is parsed
+    // TODO: make Parser return an iterator over all records in a stream.
+    fn parse_record<D: RecordData>(txt: &str) -> D {
+        let records = Parser::new(txt, None, Some(Name::root()))
+            .parse()
+            .expect("failed to parse record")
+            .1;
+        let record_set = records.into_iter().next().expect("no record found").1;
+        D::try_borrow(&record_set.into_iter().next().unwrap().data)
+            .expect("Not the correct record")
+            .clone()
+    }
+
+    #[test]
+    fn test_parsing() {
+        let svcb: HTTPS = parse_record(CF_HTTPS_RECORD);
+
+        assert_eq!(svcb.svc_priority, 1);
+        assert_eq!(svcb.target_name, Name::root());
+
+        let mut params = svcb.svc_params.iter();
+
+        // alpn
+        let param = params.next().expect("not alpn");
+        assert_eq!(param.0, SvcParamKey::Alpn);
+        let SvcParamValue::Alpn(value) = &param.1 else {
+            panic!("expected alpn");
+        };
+        assert_eq!(value.0, &[b"http/1.1".as_slice(), b"h2".as_slice()]);
+
+        // ipv4 hint
+        let param = params.next().expect("ipv4hint");
+        assert_eq!(SvcParamKey::Ipv4Hint, param.0);
+        let SvcParamValue::Ipv4Hint(value) = &param.1 else {
+            panic!("expected ipv4hint");
+        };
+        assert_eq!(
+            value.0,
+            &[A::new(162, 159, 137, 85), A::new(162, 159, 138, 85)]
+        );
+
+        // echconfig
+        let param = params.next().expect("echconfig");
+        assert_eq!(SvcParamKey::EchConfigList, param.0);
+        let SvcParamValue::EchConfigList(value) = &param.1 else {
+            panic!("expected echconfig");
+        };
+        assert_eq!(
+            value.0,
+            data_encoding::BASE64.decode(b"AEX+DQBBtgAgACBMmGJQR02doup+5VPMjYpe5HQQ/bpntFCxDa8LT2PLAgAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=").unwrap()
+        );
+
+        // ipv6 hint
+        let param = params.next().expect("ipv6hint");
+        assert_eq!(SvcParamKey::Ipv6Hint, param.0);
+        let SvcParamValue::Ipv6Hint(value) = &param.1 else {
+            panic!("expected ipv6hint");
+        };
+        assert_eq!(
+            value.0,
+            &[
+                AAAA::new(0x2606, 0x4700, 0x7, 0, 0, 0, 0xa29f, 0x8955),
+                AAAA::new(0x2606, 0x4700, 0x7, 0, 0, 0, 0xa29f, 0x8a5)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_display() {
+        let svcb: SVCB = parse_record(CF_SVCB_RECORD);
+
+        let svcb_display = svcb.to_string();
+
+        // add back the name, etc...
+        let svcb_display = format!("crypto.cloudflare.com. 299 IN SVCB {svcb_display}");
+        let svcb_display = parse_record(&svcb_display);
+
+        assert_eq!(svcb, svcb_display);
+    }
+
+    /// sanity check for https
+    #[test]
+    fn test_parsing_https() {
+        let records = [GOOGLE_HTTPS_RECORD, CF_HTTPS_RECORD];
+        for record in records.iter() {
+            let svcb: HTTPS = parse_record(record);
+
+            assert_eq!(svcb.svc_priority, 1);
+            assert_eq!(svcb.target_name, Name::root());
+        }
+    }
+
+    #[test]
+    fn invalid_alpn_token() {
+        let _ = RData::try_from_str(RecordType::SVCB, "1 . alpn=\"h")
+            .expect_err("invalid alpn token should fail");
+    }
+
+    #[test]
+    fn single_quote_value() {
+        let _ = RData::try_from_str(RecordType::SVCB, "1 . alpn=\"")
+            .expect_err("single quoted value should fail");
+    }
+
+    /// Test with RFC 9460 Appendix D test vectors
+    /// <https://datatracker.ietf.org/doc/html/rfc9460#appendix-D>
+    // TODO(XXX): Consider adding the negative "Failure Cases" from D.3.
+    #[test]
+    fn test_rfc9460_vectors() {
+        #[derive(Debug)]
+        struct TestVector {
+            record: &'static str,
+            record_type: RecordType,
+            target_name: Name,
+            priority: u16,
+            params: Vec<(SvcParamKey, SvcParamValue)>,
+        }
+
+        #[derive(Debug)]
+        enum RecordType {
+            SVCB,
+            HTTPS,
+        }
+
+        // NOTE: In each case the test vector from the RFC was augmented with a TTL (42 in each
+        //       case). The parser requires this but the test vectors do not include it.
+        let vectors: [TestVector; 9] = [
+            // https://datatracker.ietf.org/doc/html/rfc9460#appendix-D.1
+            // Figure 2: AliasMode
+            TestVector {
+                record: "example.com. 42  HTTPS   0 foo.example.com.",
+                record_type: RecordType::HTTPS,
+                target_name: Name::from_str("foo.example.com.").unwrap(),
+                priority: 0,
+                params: Vec::new(),
+            },
+            // https://datatracker.ietf.org/doc/html/rfc9460#appendix-D.2
+            // Figure 3: TargetName Is "."
+            TestVector {
+                record: "example.com. 42  SVCB   1 .",
+                record_type: RecordType::SVCB,
+                target_name: Name::from_str(".").unwrap(),
+                priority: 1,
+                params: Vec::new(),
+            },
+            // Figure 4: Specifies a Port
+            TestVector {
+                record: "example.com. 42  SVCB   16 foo.example.com. port=53",
+                record_type: RecordType::SVCB,
+                target_name: Name::from_str("foo.example.com.").unwrap(),
+                priority: 16,
+                params: vec![(SvcParamKey::Port, SvcParamValue::Port(53))],
+            },
+            // Figure 5: A Generic Key and Unquoted Value
+            TestVector {
+                record: "example.com. 42  SVCB   1 foo.example.com. key667=hello",
+                record_type: RecordType::SVCB,
+                target_name: Name::from_str("foo.example.com.").unwrap(),
+                priority: 1,
+                params: vec![(
+                    SvcParamKey::Key(667),
+                    SvcParamValue::Unknown(Unknown(b"hello".into())),
+                )],
+            },
+            // Figure 6: A Generic Key and Quoted Value with a Decimal Escape
+            TestVector {
+                record: r#"example.com. 42  SVCB   1 foo.example.com. key667="hello\210qoo""#,
+                record_type: RecordType::SVCB,
+                target_name: Name::from_str("foo.example.com.").unwrap(),
+                priority: 1,
+                params: vec![(
+                    SvcParamKey::Key(667),
+                    SvcParamValue::Unknown(Unknown(b"hello\\210qoo".into())),
+                )],
+            },
+            // Figure 7: Two Quoted IPv6 Hints
+            TestVector {
+                record: r#"example.com. 42  SVCB   1 foo.example.com. (ipv6hint="2001:db8::1,2001:db8::53:1")"#,
+                record_type: RecordType::SVCB,
+                target_name: Name::from_str("foo.example.com.").unwrap(),
+                priority: 1,
+                params: vec![(
+                    SvcParamKey::Ipv6Hint,
+                    SvcParamValue::Ipv6Hint(IpHint(vec![
+                        AAAA::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                        AAAA::new(0x2001, 0xdb8, 0, 0, 0, 0, 0x53, 1),
+                    ])),
+                )],
+            },
+            // Figure 8: An IPv6 Hint Using the Embedded IPv4 Syntax
+            TestVector {
+                record: r#"example.com.  42 SVCB   1 example.com. (ipv6hint="2001:db8:122:344::192.0.2.33")"#,
+                record_type: RecordType::SVCB,
+                target_name: Name::from_str("example.com.").unwrap(),
+                priority: 1,
+                params: vec![(
+                    SvcParamKey::Ipv6Hint,
+                    SvcParamValue::Ipv6Hint(IpHint(vec![AAAA::new(
+                        0x2001, 0xdb8, 0x122, 0x344, 0, 0, 0xc000, 0x221,
+                    )])),
+                )],
+            },
+            // Figure 9: SvcParamKey Ordering Is Arbitrary in Presentation Format but Sorted in Wire Format
+            TestVector {
+                record: r#"example.com. 42  SVCB   16 foo.example.org. (alpn=h2,h3-19 mandatory=ipv4hint,alpn ipv4hint=192.0.2.1)"#,
+                record_type: RecordType::SVCB,
+                target_name: Name::from_str("foo.example.org.").unwrap(),
+                priority: 16,
+                params: vec![
+                    (
+                        SvcParamKey::Alpn,
+                        SvcParamValue::Alpn(Alpn(vec![b"h2".to_vec(), b"h3-19".to_vec()])),
+                    ),
+                    (
+                        SvcParamKey::Mandatory,
+                        SvcParamValue::Mandatory(Mandatory(vec![
+                            SvcParamKey::Ipv4Hint,
+                            SvcParamKey::Alpn,
+                        ])),
+                    ),
+                    (
+                        SvcParamKey::Ipv4Hint,
+                        SvcParamValue::Ipv4Hint(IpHint(vec![A::new(192, 0, 2, 1)])),
+                    ),
+                ],
+            },
+            // Figure 10: An "alpn" Value with an Escaped Comma and an Escaped Backslash in Two Presentation Formats
+            TestVector {
+                record: r#"example.com.  42  SVCB   16 foo.example.org. alpn="f\\\\oo\,bar,h2""#,
+                record_type: RecordType::SVCB,
+                target_name: Name::from_str("foo.example.org.").unwrap(),
+                priority: 16,
+                params: vec![(
+                    SvcParamKey::Alpn,
+                    SvcParamValue::Alpn(Alpn(vec![br#"f\\oo,bar"#.to_vec(), b"h2".to_vec()])),
+                )],
+            },
+            /*
+             * TODO(XXX): Parser does not replace escaped characters, does not see "\092," as
+             *            an escaped delim.
+            TestVector {
+                record: r#"example.com.  42  SVCB   116 foo.example.org. alpn=f\\\092oo\092,bar,h2""#,
+                record_type: RecordType::SVCB,
+                target_name: Name::from_str("foo.example.org.").unwrap(),
+                priority: 16,
+                params: vec![(
+                    SvcParamKey::Alpn,
+                    SvcParamValue::Alpn(Alpn(vec![r#"f\\oo,bar"#.to_owned(), "h2".to_owned()])),
+                )],
+            },
+            */
+        ];
+
+        for record in vectors {
+            let expected_scvb = SVCB::new(record.priority, record.target_name, record.params);
+            match record.record_type {
+                RecordType::SVCB => {
+                    let parsed: SVCB = parse_record(record.record);
+                    assert_eq!(parsed, expected_scvb);
+                }
+                RecordType::HTTPS => {
+                    let parsed: HTTPS = parse_record(record.record);
+                    assert_eq!(parsed, HTTPS(expected_scvb));
+                }
+            };
+        }
+    }
+
+    #[test]
+    fn test_svcparamvalue_extra_data_strict() {
+        let data = [0x00, 0x50, 0x00];
+        let mut decoder = BinDecoder::new(&data);
+        SvcParamValue::read(SvcParamKey::Port, &mut decoder).unwrap_err();
+    }
+
+    #[test]
+    fn test_ipv4hint_empty() {
+        let err = SvcParamValue::read(
+            SvcParamKey::Ipv4Hint,
+            &mut BinDecoder::new(&0u16.to_be_bytes()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DecodeError::SvcParamMissingValue));
+
+        let err = Parser::new(". 86400 IN SVCB 1 . ipv4hint=", None, Some(Name::root()))
+            .parse()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ParseError::Proto(ProtoError::Decode(DecodeError::SvcParamMissingValue))
+        ));
+    }
+
+    const CF_SVCB_RECORD: &str = "crypto.cloudflare.com. 1664 IN SVCB 1 . alpn=\"http/1.1,h2\" ipv4hint=162.159.137.85,162.159.138.85 ech=AEX+DQBBtgAgACBMmGJQR02doup+5VPMjYpe5HQQ/bpntFCxDa8LT2PLAgAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA= ipv6hint=2606:4700:7::a29f:8955,2606:4700:7::a29f:8a5";
+    const CF_HTTPS_RECORD: &str = "crypto.cloudflare.com. 1664 IN HTTPS 1 . alpn=\"http/1.1,h2\" ipv4hint=162.159.137.85,162.159.138.85 ech=AEX+DQBBtgAgACBMmGJQR02doup+5VPMjYpe5HQQ/bpntFCxDa8LT2PLAgAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA= ipv6hint=2606:4700:7::a29f:8955,2606:4700:7::a29f:8a5";
+    const GOOGLE_HTTPS_RECORD: &str = "google.com 21132 IN HTTPS 1 . alpn=\"h2,h3\"";
 }

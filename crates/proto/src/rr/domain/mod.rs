@@ -8,10 +8,10 @@
 //! Domain name associated types, such as Name and Label.
 
 mod label;
-mod name;
-mod try_parse_ip;
-pub mod usage;
+pub use label::{IntoLabel, Label, LabelCmp};
 
-pub use self::label::{IntoLabel, Label};
-pub use self::name::{IntoName, LabelIter, Name};
-pub use self::try_parse_ip::TryParseIp;
+mod name;
+pub use name::{IntoName, LabelIter, Name};
+
+mod usage;
+pub use usage::{ResolverUsage, is_onion};

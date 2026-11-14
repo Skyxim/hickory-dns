@@ -15,9 +15,12 @@
  */
 #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
+use core::fmt::Debug;
+#[cfg(feature = "std")]
+use std::println;
+
 use super::*;
 use crate::error::*;
-use std::fmt::Debug;
 
 fn get_character_data() -> Vec<(&'static str, Vec<u8>)> {
     vec![
@@ -41,9 +44,7 @@ fn read_character_data() {
 
 #[test]
 fn emit_character_data() {
-    test_emit_data_set(get_character_data(), |ref mut e, d| {
-        e.emit_character_data(d)
-    });
+    test_emit_data_set(get_character_data(), |e, d| e.emit_character_data(d));
 }
 
 fn get_u16_data() -> Vec<(u16, Vec<u8>)> {
@@ -51,20 +52,20 @@ fn get_u16_data() -> Vec<(u16, Vec<u8>)> {
         (0, vec![0x00, 0x00]),
         (1, vec![0x00, 0x01]),
         (256, vec![0x01, 0x00]),
-        (u16::max_value(), vec![0xFF, 0xFF]),
+        (u16::MAX, vec![0xFF, 0xFF]),
     ]
 }
 
 #[test]
 fn read_u16() {
     test_read_data_set(get_u16_data(), |mut d| {
-        d.read_u16().map(Restrict::unverified).map_err(Into::into)
+        d.read_u16().map(Restrict::unverified)
     });
 }
 
 #[test]
 fn emit_u16() {
-    test_emit_data_set(get_u16_data(), |ref mut e, d| e.emit_u16(d));
+    test_emit_data_set(get_u16_data(), |e, d| d.emit(e));
 }
 
 fn get_i32_data() -> Vec<(i32, Vec<u8>)> {
@@ -75,21 +76,21 @@ fn get_i32_data() -> Vec<(i32, Vec<u8>)> {
         (256 * 256, vec![0x00, 0x01, 0x00, 0x00]),
         (256 * 256 * 256, vec![0x01, 0x00, 0x00, 0x00]),
         (-1, vec![0xFF, 0xFF, 0xFF, 0xFF]),
-        (i32::min_value(), vec![0x80, 0x00, 0x00, 0x00]),
-        (i32::max_value(), vec![0x7F, 0xFF, 0xFF, 0xFF]),
+        (i32::MIN, vec![0x80, 0x00, 0x00, 0x00]),
+        (i32::MAX, vec![0x7F, 0xFF, 0xFF, 0xFF]),
     ]
 }
 
 #[test]
 fn read_i32() {
     test_read_data_set(get_i32_data(), |mut d| {
-        d.read_i32().map(Restrict::unverified).map_err(Into::into)
+        d.read_i32().map(Restrict::unverified)
     });
 }
 
 #[test]
 fn emit_i32() {
-    test_emit_data_set(get_i32_data(), |ref mut e, d| e.emit_i32(d));
+    test_emit_data_set(get_i32_data(), |e, d| d.emit(e));
 }
 
 #[allow(clippy::unreadable_literal)]
@@ -100,44 +101,48 @@ fn get_u32_data() -> Vec<(u32, Vec<u8>)> {
         (256, vec![0x00, 0x00, 0x01, 0x00]),
         (256 * 256, vec![0x00, 0x01, 0x00, 0x00]),
         (256 * 256 * 256, vec![0x01, 0x00, 0x00, 0x00]),
-        (u32::max_value(), vec![0xFF, 0xFF, 0xFF, 0xFF]),
+        (u32::MAX, vec![0xFF, 0xFF, 0xFF, 0xFF]),
         (2147483648, vec![0x80, 0x00, 0x00, 0x00]),
-        (i32::max_value() as u32, vec![0x7F, 0xFF, 0xFF, 0xFF]),
+        (i32::MAX as u32, vec![0x7F, 0xFF, 0xFF, 0xFF]),
     ]
 }
 
 #[test]
 fn read_u32() {
     test_read_data_set(get_u32_data(), |mut d| {
-        d.read_u32().map(Restrict::unverified).map_err(Into::into)
+        d.read_u32().map(Restrict::unverified)
     });
 }
 
 #[test]
 fn emit_u32() {
-    test_emit_data_set(get_u32_data(), |ref mut e, d| e.emit_u32(d));
+    test_emit_data_set(get_u32_data(), |e, d| d.emit(e));
 }
 
-pub fn test_read_data_set<E, F>(data_set: Vec<(E, Vec<u8>)>, read_func: F)
+#[cfg_attr(not(feature = "std"), expect(clippy::unused_enumerate_index))]
+pub(crate) fn test_read_data_set<E, F>(data_set: Vec<(E, Vec<u8>)>, read_func: F)
 where
     E: PartialEq<E> + Debug,
-    F: Fn(BinDecoder<'_>) -> ProtoResult<E>,
+    F: Fn(BinDecoder<'_>) -> Result<E, DecodeError>,
 {
-    for (test_pass, (expect, binary)) in data_set.into_iter().enumerate() {
-        println!("test {test_pass}: {binary:?}");
+    for (_test_pass, (expect, binary)) in data_set.into_iter().enumerate() {
+        #[cfg(feature = "std")]
+        println!("test {_test_pass}: {binary:?}");
 
         let decoder = BinDecoder::new(&binary);
         assert_eq!(read_func(decoder).unwrap(), expect);
     }
 }
 
-pub fn test_emit_data_set<S, F>(data_set: Vec<(S, Vec<u8>)>, emit_func: F)
+#[cfg_attr(not(feature = "std"), expect(clippy::unused_enumerate_index))]
+pub(crate) fn test_emit_data_set<S, F>(data_set: Vec<(S, Vec<u8>)>, emit_func: F)
 where
     F: Fn(&mut BinEncoder<'_>, S) -> ProtoResult<()>,
     S: Debug,
 {
-    for (test_pass, (data, expect)) in data_set.into_iter().enumerate() {
-        println!("test {test_pass}: {data:?}");
+    for (_test_pass, (data, expect)) in data_set.into_iter().enumerate() {
+        #[cfg(feature = "std")]
+        println!("test {_test_pass}: {data:?}");
 
         let mut bytes: Vec<u8> = Vec::with_capacity(512);
         {

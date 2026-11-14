@@ -7,21 +7,21 @@
 
 //! HTTPS type and related implementations
 
-use std::{fmt, ops::Deref};
+use core::{fmt, ops::Deref};
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::ProtoResult,
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
-    serialize::binary::{BinDecoder, BinEncodable, BinEncoder, Restrict},
+    serialize::binary::{BinDecoder, BinEncodable, BinEncoder, DecodeError},
 };
 
 use super::SVCB;
 
 /// HTTPS is really a derivation of the original SVCB record data. See SVCB for more documentation
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct HTTPS(pub SVCB);
 
@@ -40,19 +40,12 @@ impl BinEncodable for HTTPS {
 }
 
 impl<'r> RecordDataDecodable<'r> for HTTPS {
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self> {
-        SVCB::read_data(decoder, length).map(Self)
+    fn read_data(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
+        SVCB::read_data(decoder).map(Self)
     }
 }
 
 impl RecordData for HTTPS {
-    fn try_from_rdata(data: RData) -> Result<Self, RData> {
-        match data {
-            RData::HTTPS(https) => Ok(https),
-            _ => Err(data),
-        }
-    }
-
     fn try_borrow(data: &RData) -> Option<&Self> {
         match data {
             RData::HTTPS(https) => Some(https),

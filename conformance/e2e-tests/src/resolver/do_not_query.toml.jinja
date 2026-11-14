@@ -1,0 +1,20 @@
+user = "nobody"
+group = "nogroup"
+
+[[zones]]
+zone = "."
+
+[zones.stores]
+type = "recursor"
+roots = "/etc/root.hints"
+dnssec_policy = "ValidationDisabled"
+allow_server = [
+    {% for network in allow_server %}
+    "{{ network }}",
+    {% endfor %}
+]
+deny_server = [
+    {% for network in deny_server %}
+    "{{ network }}",
+    {% endfor %}
+]

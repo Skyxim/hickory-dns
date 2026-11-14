@@ -8,20 +8,22 @@
 //! class of DNS operations, in general always IN for internet
 #![allow(clippy::use_self)]
 
-use std::cmp::Ordering;
-use std::fmt::{self, Display, Formatter};
-use std::str::FromStr;
+use alloc::borrow::ToOwned;
+use core::{
+    cmp::Ordering,
+    fmt::{self, Display, Formatter},
+    str::FromStr,
+};
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::error::*;
 use crate::serialize::binary::*;
 
 /// The DNS Record class
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
-#[allow(dead_code)]
 pub enum DNSClass {
     /// Internet
     IN,
@@ -41,51 +43,30 @@ pub enum DNSClass {
 }
 
 impl FromStr for DNSClass {
-    type Err = ProtoError;
+    type Err = DecodeError;
 
     /// Convert from `&str` to `DNSClass`
     ///
     /// ```
     /// use std::str::FromStr;
-    /// use hickory_proto::rr::dns_class::DNSClass;
+    /// use hickory_proto::rr::DNSClass;
     ///
     /// let var: DNSClass = DNSClass::from_str("IN").unwrap();
     /// assert_eq!(DNSClass::IN, var);
     /// ```
-    fn from_str(str: &str) -> ProtoResult<Self> {
-        debug_assert!(str.chars().all(|x| !char::is_ascii_lowercase(&x)));
+    fn from_str(str: &str) -> Result<Self, Self::Err> {
         match str {
             "IN" => Ok(Self::IN),
             "CH" => Ok(Self::CH),
             "HS" => Ok(Self::HS),
             "NONE" => Ok(Self::NONE),
             "ANY" | "*" => Ok(Self::ANY),
-            _ => Err(ProtoErrorKind::UnknownDnsClassStr(str.to_string()).into()),
+            _ => Err(DecodeError::UnknownDnsClassStr(str.to_owned())),
         }
     }
 }
 
 impl DNSClass {
-    /// Convert from `u16` to `DNSClass`
-    ///
-    /// ```
-    /// use hickory_proto::rr::dns_class::DNSClass;
-    ///
-    /// let var = DNSClass::from_u16(1).unwrap();
-    /// assert_eq!(DNSClass::IN, var);
-    /// ```
-    #[deprecated(note = "use u16::into instead, this is now infallible")]
-    pub fn from_u16(value: u16) -> ProtoResult<Self> {
-        match value {
-            1 => Ok(Self::IN),
-            3 => Ok(Self::CH),
-            4 => Ok(Self::HS),
-            254 => Ok(Self::NONE),
-            255 => Ok(Self::ANY),
-            _ => Ok(Self::Unknown(value)),
-        }
-    }
-
     /// Return the OPT version from value
     pub fn for_opt(value: u16) -> Self {
         // From RFC 6891: `Values lower than 512 MUST be treated as equal to 512`
@@ -96,12 +77,12 @@ impl DNSClass {
 
 impl BinEncodable for DNSClass {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u16((*self).into())
+        u16::from(*self).emit(encoder)
     }
 }
 
-impl<'r> BinDecodable<'r> for DNSClass {
-    fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<Self> {
+impl BinDecodable<'_> for DNSClass {
+    fn read(decoder: &mut BinDecoder<'_>) -> Result<Self, DecodeError> {
         let this = Self::from(
             decoder.read_u16()?.unverified(/*DNSClass is verified as safe in processing this*/),
         );
@@ -115,7 +96,7 @@ impl<'r> BinDecodable<'r> for DNSClass {
 /// Convert from `DNSClass` to `&str`
 ///
 /// ```
-/// use hickory_proto::rr::dns_class::DNSClass;
+/// use hickory_proto::rr::DNSClass;
 ///
 /// let var: &'static str = DNSClass::IN.into();
 /// assert_eq!("IN", var);
@@ -137,7 +118,7 @@ impl From<DNSClass> for &'static str {
 /// Convert from `u16` to `DNSClass`
 ///
 /// ```
-/// use hickory_proto::rr::dns_class::DNSClass;
+/// use hickory_proto::rr::DNSClass;
 ///
 /// let var: DNSClass = 1u16.into();
 /// assert_eq!(DNSClass::IN, var);
@@ -158,7 +139,7 @@ impl From<u16> for DNSClass {
 /// Convert from `DNSClass` to `u16`
 ///
 /// ```
-/// use hickory_proto::rr::dns_class::DNSClass;
+/// use hickory_proto::rr::DNSClass;
 ///
 /// let var: u16 = DNSClass::IN.into();
 /// assert_eq!(1, var);
@@ -224,6 +205,9 @@ mod tests {
     #[test]
     fn check_dns_class_parse_wont_panic_with_symbols() {
         let dns_class = "a-b-c".to_ascii_uppercase().parse::<DNSClass>();
-        assert!(matches!(&dns_class, Err(ProtoError { .. })));
+        assert!(matches!(
+            &dns_class,
+            Err(DecodeError::UnknownDnsClassStr(_))
+        ));
     }
 }

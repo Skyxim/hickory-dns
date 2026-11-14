@@ -1,17 +1,12 @@
 [package]
 name = "hickory-resolver"
 
-# A short blurb about the package. This is not rendered in any format when
-# uploaded to crates.io (aka this is not markdown)
 description = """
-Hickory DNS is a safe and secure DNS library. This Resolver library  uses the Client library to perform all DNS queries. The Resolver is intended to be a high-level library for any DNS record resolution see Resolver and AsyncResolver for supported resolution types. The Client can be used for other queries.
+hickory-resolver is a safe and secure DNS stub resolver library intended to be a high-level library
+for DNS record resolution.
 """
 
-# These URLs point to more information about the repository
 documentation = "https://docs.rs/hickory-resolver"
-
-# This points to a file in the repository (relative to this Cargo.toml). The
-# contents of this file are stored and indexed in the registry.
 readme = "README.md"
 
 version.workspace = true
@@ -24,105 +19,90 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 
-[badges]
-#github-actions = { repository = "bluejekyll/hickory", branch = "main", workflow = "test" }
-codecov = { repository = "hickory-dns/hickory-dns", branch = "main", service = "github" }
-maintenance = { status = "actively-developed" }
-
 [features]
-default = ["system-config", "tokio-runtime"]
-#backtrace = ["dep:backtrace", "hickory-proto/backtrace"]
-dns-over-native-tls = [
-    "dns-over-tls",
-    "tokio-native-tls",
-    "hickory-proto/dns-over-native-tls",
-]
-# DNS over TLS with OpenSSL currently needs a good way to set default CAs, use rustls or native-tls
-dns-over-openssl = [
-    "dns-over-tls",
-    "hickory-proto/dns-over-openssl",
-    "tokio-openssl",
-]
-dns-over-rustls = [
-    "dns-over-tls",
-    "rustls",
-    "tokio-rustls",
-    "hickory-proto/dns-over-rustls",
-]
-dns-over-tls = ["tokio-runtime"]
+default = ["system-config", "tokio"]
 
-# This requires some TLS library, currently only rustls is supported
-dns-over-https-rustls = [
-    "hickory-proto/dns-over-https-rustls",
-    "dns-over-rustls",
-    "dns-over-https",
-]
-dns-over-https = ["hickory-proto/dns-over-https"]
-dns-over-quic = [
-    "rustls/quic",
-    "dns-over-rustls",
-    "hickory-proto/dns-over-quic",
-]
-dns-over-h3 = ["dns-over-rustls", "hickory-proto/dns-over-h3"]
+tls-aws-lc-rs = ["hickory-net/tls-aws-lc-rs", "__tls"]
+https-aws-lc-rs = ["hickory-net/https-aws-lc-rs", "__https"]
+quic-aws-lc-rs = ["hickory-net/quic-aws-lc-rs", "__quic", "quinn/rustls-aws-lc-rs"]
+h3-aws-lc-rs = ["hickory-net/h3-aws-lc-rs", "__h3"]
 
-webpki-roots = ["dep:webpki-roots", "hickory-proto/webpki-roots"]
-native-certs = ["dep:rustls-native-certs", "hickory-proto/native-certs"]
+tls-ring = ["hickory-net/tls-ring", "__tls"]
+https-ring = ["hickory-net/https-ring", "__https"]
+quic-ring = ["hickory-net/quic-ring", "__quic", "quinn/rustls-ring"]
+h3-ring = ["hickory-net/h3-ring", "__h3"]
 
-dnssec-openssl = ["dnssec", "hickory-proto/dnssec-openssl"]
-dnssec-ring = ["dnssec", "hickory-proto/dnssec-ring"]
-dnssec = []
+__tls = ["dep:rustls", "dep:tokio-rustls", "tokio"]
+__https = ["__tls"]
+__quic = ["dep:quinn", "__tls"]
+__h3 = ["__quic"]
 
-serde-config = ["serde", "hickory-proto/serde-config"]
-system-config = ["ipconfig", "resolv-conf"]
+webpki-roots = ["hickory-net/webpki-roots"]
+rustls-platform-verifier = ["hickory-net/rustls-platform-verifier"]
 
-# # enables experimental the mDNS (multicast) feature
-# TODO: we will be revisiting how mdns is built into the resolver...
-#mdns = ["hickory-proto/mdns"]
+dnssec-aws-lc-rs = ["hickory-proto/dnssec-aws-lc-rs", "hickory-net/dnssec-aws-lc-rs", "__dnssec"]
+dnssec-ring = ["hickory-proto/dnssec-ring", "hickory-net/dnssec-ring", "__dnssec"]
+__dnssec = []
 
-testing = []
-tokio-runtime = ["tokio/rt", "hickory-proto/tokio-runtime"]
+recursor = ["dep:lru-cache"]
 
-[lib]
-name = "hickory_resolver"
-path = "src/lib.rs"
+serde = ["dep:serde", "hickory-proto/serde"]
+system-config = ["dep:ipconfig", "dep:resolv-conf", "dep:jni", "dep:ndk-context", "dep:system-configuration"]
+
+toml = ["dep:toml", "serde"]
+
+tokio = ["dep:tokio", "tokio/rt", "hickory-net/tokio"]
+
+metrics = ["dep:metrics"]
 
 [dependencies]
-#backtrace = { version = "0.3.50", optional = true }
 cfg-if.workspace = true
 futures-util = { workspace = true, default-features = false, features = [
     "std",
 ] }
-lru-cache.workspace = true
-once_cell.workspace = true
+metrics = { workspace = true, optional = true }
+ipnet = { workspace = true, features = ["serde"] }
+lru-cache = { workspace = true, optional = true }
+moka = { workspace = true, features = ["sync"] }
 parking_lot.workspace = true
+quinn = { workspace = true, optional = true, features = [
+    "log",
+    "runtime-tokio",
+] }
 rand.workspace = true
 resolv-conf = { workspace = true, optional = true, features = ["system"] }
 rustls = { workspace = true, optional = true }
-rustls-native-certs = { workspace = true, optional = true }
-serde = { workspace = true, features = ["derive"], optional = true }
+serde = { workspace = true, features = ["derive", "rc"], optional = true }
 smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, optional = true }
-tokio-native-tls = { workspace = true, optional = true }
-tokio-openssl = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
-hickory-proto = { workspace = true, default-features = false }
-webpki-roots = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+hickory-net = { workspace = true }
+hickory-proto = { workspace = true, features = ["access-control"] }
 
 [target.'cfg(windows)'.dependencies]
 ipconfig = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { workspace = true, optional = true }
+ndk-context = { workspace = true, optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+system-configuration = { workspace = true, optional = true }
+
 [dev-dependencies]
-futures-executor = { workspace = true, default-features = false, features = [
-    "std",
-] }
+async-trait.workspace = true
+criterion = { workspace = true }
+futures-executor = { workspace = true, default-features = false, features = ["std"] }
+hickory-proto = { workspace = true }
+metrics-util = { workspace = true, features = ["debugging"] }
+serde_json = { workspace = true }
+test-support.workspace = true
 tokio = { workspace = true, features = ["macros", "test-util"] }
-tracing-subscriber = { workspace = true, features = [
-    "std",
-    "fmt",
-    "env-filter",
-] }
+toml.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "std"] }
 
 [package.metadata.docs.rs]
 all-features = true
@@ -130,18 +110,31 @@ default-target = "x86_64-unknown-linux-gnu"
 targets = ["x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
 rustdoc-args = ["--cfg", "docsrs"]
 
+[[bench]]
+name = "recursor"
+harness = false
+required-features = ["recursor", "tokio"]
+
 [[example]]
 name = "custom_provider"
-required-features = ["tokio-runtime"]
+required-features = ["tokio"]
 
 [[example]]
 name = "flush_cache"
-required-features = ["tokio-runtime", "system-config"]
+required-features = ["tokio", "system-config"]
 
 [[example]]
 name = "global_resolver"
-required-features = ["tokio-runtime", "system-config"]
+required-features = ["tokio", "system-config"]
 
 [[example]]
 name = "multithreaded_runtime"
-required-features = ["tokio-runtime", "system-config"]
+required-features = ["tokio", "system-config"]
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-all-features]
+skip_optional_dependencies = true
+max_combination_size = 2
+denylist = ["__tls", "__https", "__quic", "__h3", "__dnssec"]

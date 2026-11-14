@@ -7,16 +7,23 @@
 
 //! Extended DNS options
 
-use std::fmt;
+use core::fmt;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use tracing::{trace, warn};
+
+#[cfg(feature = "__dnssec")]
+use crate::dnssec::{Algorithm, SupportedAlgorithms};
 use crate::{
     error::*,
+    op::ResponseCode,
     rr::{
-        rdata::{
-            opt::{EdnsCode, EdnsOption},
-            OPT,
-        },
         DNSClass, Name, RData, Record, RecordType,
+        rdata::{
+            OPT,
+            opt::{EdnsCode, EdnsOption, NSIDPayload},
+        },
     },
     serialize::binary::{BinEncodable, BinEncoder},
 };
@@ -24,14 +31,14 @@ use crate::{
 /// Edns implements the higher level concepts for working with extended dns as it is used to create or be
 /// created from OPT record data.
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub struct Edns {
     // high 8 bits that make up the 12 bit total field when included with the 4bit rcode from the
     //  header (from TTL)
     rcode_high: u8,
     // Indicates the implementation level of the setter. (from TTL)
     version: u8,
-    // DNSSEC OK and Z flags (from TTL)
-    flags: u16,
+    flags: EdnsFlags,
     // max payload size, minimum of 512, (from RR CLASS)
     max_payload: u16,
 
@@ -43,7 +50,7 @@ impl Default for Edns {
         Self {
             rcode_high: 0,
             version: 0,
-            flags: 0,
+            flags: EdnsFlags::default(),
             max_payload: 512,
             options: OPT::default(),
         }
@@ -56,6 +63,57 @@ impl Edns {
         Self::default()
     }
 
+    /// Creates an EDNS object suitable for a response, based on the request EDNS.
+    pub fn for_response(
+        &self,
+        max_payload_size: u16,
+        nsid: Option<&NSIDPayload>,
+    ) -> (Self, Result<(), ResponseCode>) {
+        let mut resp_edns = Self::default();
+
+        // check our version against the request
+        // TODO: what version are we?
+        let our_version = 0;
+        #[cfg(feature = "__dnssec")]
+        resp_edns.set_dnssec_ok(self.flags().dnssec_ok);
+        resp_edns.set_max_payload(max_payload_size);
+        resp_edns.set_version(our_version);
+
+        if self.version() > our_version {
+            warn!(
+                "request edns version greater than {}: {}",
+                our_version,
+                self.version()
+            );
+            return (resp_edns, Err(ResponseCode::BADVERS));
+        }
+
+        // RFC 5001 "DNS Name Server Identifier (NSID) Option" handling.
+        match (self.option(EdnsCode::NSID), nsid) {
+            // NSID was requested, and we have a payload to reply with. Add it to the
+            // response EDNS.
+            (Some(request_option), Some(payload)) => {
+                // "The name server MUST ignore any NSID payload data that might be
+                //  present in the query message."
+                if !request_option.is_empty() {
+                    warn!("ignoring non-empty EDNS NSID request payload")
+                }
+                resp_edns
+                    .options_mut()
+                    .insert(EdnsOption::NSID(payload.clone()));
+            }
+            // NSID was requested, but we don't have a payload configured.
+            (Some(_), None) => {
+                trace!("ignoring EDNS NSID request - no response payload configured")
+            }
+            // "A name server MUST NOT send an NSID option back to a resolver which
+            // did not request it."
+            (None, _) => {}
+        };
+
+        (resp_edns, Ok(()))
+    }
+
     /// The high order bytes for the response code in the DNS Message
     pub fn rcode_high(&self) -> u8 {
         self.rcode_high
@@ -66,17 +124,14 @@ impl Edns {
         self.version
     }
 
-    /// Specifies that DNSSEC is supported for this Client or Server
-    pub fn dnssec_ok(&self) -> bool {
-        self.flags & 0x8000 == 0x8000
+    /// Returns the [`EdnsFlags`] portion of EDNS
+    pub fn flags(&self) -> &EdnsFlags {
+        &self.flags
     }
 
-    /// Returns the Z flags.
-    /// Should be ignored by receivers.
-    /// Only the low 15 bits are significant.
-    /// The high bit is always returned as zero.
-    pub fn z_flags(&self) -> u16 {
-        self.flags & 0x7FFF
+    /// Returns a mutable reference to the [`EdnsFlags`]
+    pub fn flags_mut(&mut self) -> &mut EdnsFlags {
+        &mut self.flags
     }
 
     /// Maximum supported size of the DNS payload
@@ -111,23 +166,39 @@ impl Edns {
         self
     }
 
-    /// Set to true if DNSSEC is supported
-    pub fn set_dnssec_ok(&mut self, dnssec_ok: bool) -> &mut Self {
-        if dnssec_ok {
-            self.flags |= 0x8000;
-        } else {
-            self.flags &= !0x8000;
+    /// Creates a new extended DNS object prepared for DNSSEC messages.
+    #[cfg(feature = "__dnssec")]
+    pub fn enable_dnssec(&mut self) {
+        self.set_dnssec_ok(true);
+        self.set_default_algorithms();
+    }
+
+    /// Set the default algorithms which are supported by this handle
+    #[cfg(feature = "__dnssec")]
+    pub fn set_default_algorithms(&mut self) -> &mut Self {
+        let mut algorithms = SupportedAlgorithms::new();
+
+        for algorithm in [
+            Algorithm::RSASHA256,
+            Algorithm::RSASHA512,
+            Algorithm::ECDSAP256SHA256,
+            Algorithm::ECDSAP384SHA384,
+            Algorithm::ED25519,
+        ] {
+            if algorithm.is_supported() {
+                algorithms.set(algorithm);
+            }
         }
+
+        let dau = EdnsOption::DAU(algorithms);
+
+        self.options_mut().insert(dau);
         self
     }
 
-    /// Set the Z flags.
-    /// Should be set to zero by senders.
-    /// Only the low 15 bits are significant.
-    /// The high bit is ignored.
-    pub fn set_z_flags(&mut self, z: u16) -> &mut Self {
-        self.flags &= !0x7FFF;
-        self.flags |= z & 0x7FFF;
+    /// Set to true if DNSSEC is supported
+    pub fn set_dnssec_ok(&mut self, dnssec_ok: bool) -> &mut Self {
+        self.flags.dnssec_ok = dnssec_ok;
         self
     }
 
@@ -137,12 +208,6 @@ impl Edns {
         self.max_payload = max_payload.max(512);
         self
     }
-
-    /// Set the specified EDNS option
-    #[deprecated(note = "Please use options_mut().insert() to modify")]
-    pub fn set_option(&mut self, option: EdnsOption) {
-        self.options.insert(option);
-    }
 }
 
 // FIXME: this should be a TryFrom
@@ -150,22 +215,22 @@ impl<'a> From<&'a Record> for Edns {
     fn from(value: &'a Record) -> Self {
         assert!(value.record_type() == RecordType::OPT);
 
-        let rcode_high: u8 = ((value.ttl() & 0xFF00_0000u32) >> 24) as u8;
-        let version: u8 = ((value.ttl() & 0x00FF_0000u32) >> 16) as u8;
-        let flags: u16 = (value.ttl() & 0x0000_FFFFu32) as u16;
-        let max_payload: u16 = u16::from(value.dns_class());
+        let rcode_high = ((value.ttl & 0xFF00_0000u32) >> 24) as u8;
+        let version = ((value.ttl & 0x00FF_0000u32) >> 16) as u8;
+        let flags = EdnsFlags::from((value.ttl & 0x0000_FFFFu32) as u16);
+        let max_payload = u16::from(value.dns_class);
 
-        let options: OPT = match value.data() {
+        let options = match &value.data {
             RData::Update0(..) | RData::NULL(..) => {
                 // NULL, there was no data in the OPT
                 OPT::default()
             }
-            RData::OPT(ref option_data) => {
+            RData::OPT(option_data) => {
                 option_data.clone() // TODO: Edns should just refer to this, have the same lifetime as the Record
             }
             _ => {
                 // this should be a coding error, as opposed to a parsing error.
-                panic!("rr_type doesn't match the RData: {:?}", value.data()) // valid panic, never should happen
+                panic!("rr_type doesn't match the RData: {:?}", value.data) // valid panic, never should happen
             }
         };
 
@@ -186,38 +251,36 @@ impl<'a> From<&'a Edns> for Record {
         // rebuild the TTL field
         let mut ttl: u32 = u32::from(value.rcode_high()) << 24;
         ttl |= u32::from(value.version()) << 16;
-        ttl |= u32::from(value.flags);
+        ttl |= u32::from(u16::from(value.flags));
 
         // now for each option, write out the option array
         //  also, since this is a hash, there is no guarantee that ordering will be preserved from
         //  the original binary format.
         // maybe switch to: https://crates.io/crates/linked-hash-map/
         let mut record = Self::from_rdata(Name::root(), ttl, RData::OPT(value.options().clone()));
-
-        record.set_dns_class(DNSClass::for_opt(value.max_payload()));
-
+        record.dns_class = DNSClass::for_opt(value.max_payload());
         record
     }
 }
 
 impl BinEncodable for Edns {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit(0)?; // Name::root
+        0u8.emit(encoder)?; // Name::root
         RecordType::OPT.emit(encoder)?; //self.rr_type.emit(encoder)?;
         DNSClass::for_opt(self.max_payload()).emit(encoder)?; // self.dns_class.emit(encoder)?;
 
         // rebuild the TTL field
-        let mut ttl: u32 = u32::from(self.rcode_high()) << 24;
+        let mut ttl = u32::from(self.rcode_high()) << 24;
         ttl |= u32::from(self.version()) << 16;
-        ttl |= u32::from(self.flags);
+        ttl |= u32::from(u16::from(self.flags));
 
-        encoder.emit_u32(ttl)?;
+        ttl.emit(encoder)?;
 
         // write the opts as rdata...
         let place = encoder.place::<u16>()?;
         self.options.emit(encoder)?;
         let len = encoder.len_since_place(&place);
-        assert!(len <= u16::max_value() as usize);
+        assert!(len <= u16::MAX as usize);
 
         place.replace(encoder, len as u16)?;
         Ok(())
@@ -227,50 +290,135 @@ impl BinEncodable for Edns {
 impl fmt::Display for Edns {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         let version = self.version;
-        let dnssec_ok = self.dnssec_ok();
-        let z_flags = self.z_flags();
+        let dnssec_ok = self.flags.dnssec_ok;
+        let z_flags = self.flags.z;
         let max_payload = self.max_payload;
 
         write!(
             f,
-            "version: {version} dnssec_ok: {dnssec_ok} z_flags: 0x{z_flags:04x} max_payload: {max_payload} opts: {opts_len}",
-            version = version,
-            dnssec_ok = dnssec_ok,
-            z_flags = z_flags,
-            max_payload = max_payload,
+            "version: {version} dnssec_ok: {dnssec_ok} z_flags: {z_flags} max_payload: {max_payload} opts: {opts_len}",
             opts_len = self.options().as_ref().len()
         )
     }
 }
 
-#[cfg(feature = "dnssec")]
-#[test]
-fn test_encode_decode() {
-    use crate::rr::dnssec::SupportedAlgorithms;
+/// EDNS flags
+///
+/// <https://www.rfc-editor.org/rfc/rfc6891#section-6.1.4>
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+pub struct EdnsFlags {
+    /// DNSSEC OK bit as defined by RFC 3225
+    pub dnssec_ok: bool,
+    /// Remaining bits in the flags field
+    ///
+    /// Note that the most significant bit in this value is represented by the `dnssec_ok` field.
+    /// As such, it will be zero when decoding and will not be encoded.
+    ///
+    /// Unless you have a specific need to set this value, we recommend leaving this as zero.
+    pub z: u16,
+}
 
-    let mut edns: Edns = Edns::new();
+impl From<u16> for EdnsFlags {
+    fn from(flags: u16) -> Self {
+        Self {
+            dnssec_ok: flags & 0x8000 == 0x8000,
+            z: flags & 0x7FFF,
+        }
+    }
+}
 
-    edns.set_dnssec_ok(true);
-    edns.set_z_flags(0x4001);
-    edns.set_max_payload(0x8008);
-    edns.set_version(0x40);
-    edns.set_rcode_high(0x01);
-    edns.options_mut()
-        .insert(EdnsOption::DAU(SupportedAlgorithms::all()));
+impl From<EdnsFlags> for u16 {
+    fn from(flags: EdnsFlags) -> Self {
+        match flags.dnssec_ok {
+            true => 0x8000 | flags.z,
+            false => 0x7FFF & flags.z,
+        }
+    }
+}
 
-    let record: Record = (&edns).into();
-    let edns_decode: Edns = (&record).into();
+/// Default maximum payload length for EDNS messages.
+///
+/// Per 2020 DNS flag day, default to 1232 bytes.
+///
+/// <https://www.dnsflagday.net/2020/>
+pub const DEFAULT_MAX_PAYLOAD_LEN: u16 = 1232;
 
-    assert_eq!(edns.dnssec_ok(), edns_decode.dnssec_ok());
-    assert_eq!(edns.z_flags(), edns_decode.z_flags());
-    assert_eq!(edns.max_payload(), edns_decode.max_payload());
-    assert_eq!(edns.version(), edns_decode.version());
-    assert_eq!(edns.rcode_high(), edns_decode.rcode_high());
-    assert_eq!(edns.options(), edns_decode.options());
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // re-insert and remove using mut
-    edns.options_mut()
-        .insert(EdnsOption::DAU(SupportedAlgorithms::all()));
-    edns.options_mut().remove(EdnsCode::DAU);
-    assert!(edns.option(EdnsCode::DAU).is_none());
+    #[test]
+    #[cfg(feature = "__dnssec")]
+    fn test_encode_decode() {
+        let mut edns = Edns::new();
+
+        let flags = edns.flags_mut();
+        flags.dnssec_ok = true;
+        flags.z = 1;
+        edns.set_max_payload(0x8008);
+        edns.set_version(0x40);
+        edns.set_rcode_high(0x01);
+        edns.options_mut()
+            .insert(EdnsOption::DAU(SupportedAlgorithms::all()));
+
+        let record = Record::from(&edns);
+        let edns_decode = Edns::from(&record);
+
+        assert_eq!(edns.flags().dnssec_ok, edns_decode.flags().dnssec_ok);
+        assert_eq!(edns.flags().z, edns_decode.flags().z);
+        assert_eq!(edns.max_payload(), edns_decode.max_payload());
+        assert_eq!(edns.version(), edns_decode.version());
+        assert_eq!(edns.rcode_high(), edns_decode.rcode_high());
+        assert_eq!(edns.options(), edns_decode.options());
+
+        // re-insert and remove using mut
+        edns.options_mut()
+            .insert(EdnsOption::DAU(SupportedAlgorithms::all()));
+        edns.options_mut().remove(EdnsCode::DAU);
+        assert!(edns.option(EdnsCode::DAU).is_none());
+    }
+
+    // Test that requesting NSID produces no NSID response when a payload isn't configured.
+    #[test]
+    fn test_nsid_disabled_requested() {
+        let (response, result) = nsid_request().for_response(DEFAULT_MAX_PAYLOAD_LEN, None);
+        assert_eq!(result, Ok(()));
+        assert!(
+            response.option(EdnsCode::NSID).is_none(),
+            "unexpected NSID in reply EDNS"
+        );
+    }
+
+    // Test that **not** requesting NSID produces no NSID response, even when a payload is configured.
+    #[test]
+    fn test_nsid_enabled_not_requested() {
+        let nsid = NSIDPayload::new(vec![0xC0, 0xFF, 0xEE]).unwrap();
+        let (response, result) = Edns::new().for_response(DEFAULT_MAX_PAYLOAD_LEN, Some(&nsid));
+        assert_eq!(result, Ok(()));
+        assert!(
+            response.option(EdnsCode::NSID).is_none(),
+            "unexpected NSID in reply EDNS"
+        );
+    }
+
+    // Test that requesting NSID when a payload is configured produces the expected payload
+    // in the response.
+    #[test]
+    fn test_nsid_enabled_and_requested() {
+        let nsid = NSIDPayload::new(vec![0xC0, 0xFF, 0xEE]).unwrap();
+        let (response, result) = nsid_request().for_response(DEFAULT_MAX_PAYLOAD_LEN, Some(&nsid));
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            response.option(EdnsCode::NSID),
+            Some(&EdnsOption::NSID(nsid))
+        );
+    }
+
+    fn nsid_request() -> Edns {
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::NSID(NSIDPayload::new([]).unwrap()));
+        edns
+    }
 }

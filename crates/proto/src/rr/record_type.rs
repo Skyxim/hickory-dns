@@ -8,11 +8,12 @@
 //! record type definitions
 #![allow(clippy::use_self)]
 
-use std::cmp::Ordering;
-use std::fmt::{self, Display, Formatter};
-use std::str::FromStr;
+use alloc::borrow::ToOwned;
+use core::cmp::Ordering;
+use core::fmt::{self, Display, Formatter};
+use core::str::FromStr;
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::error::*;
@@ -25,9 +26,8 @@ use crate::serialize::binary::*;
 /// The type of the resource record.
 ///
 /// This specifies the type of data in the RData field of the Resource Record
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
-#[allow(dead_code)]
 #[non_exhaustive]
 pub enum RecordType {
     /// [RFC 1035](https://tools.ietf.org/html/rfc1035) IPv4 Address record
@@ -48,12 +48,14 @@ pub enum RecordType {
     CDS,
     /// [RFC 7344](https://tools.ietf.org/html/rfc7344) Child DNSKEY
     CDNSKEY,
-    //  CERT,       // 37 RFC 4398 Certificate record
+    /// [RFC 4398](https://tools.ietf.org/html/rfc4398) Storing Certificates in the Domain Name System (DNS)
+    CERT,
     /// [RFC 1035](https://tools.ietf.org/html/rfc1035) Canonical name record
     CNAME,
     //  DHCID,      // 49 RFC 4701 DHCP identifier
     //  DLV,        //	32769	RFC 4431	DNSSEC Lookaside Validation record
-    //  DNAME,      // 39 RFC 2672 Delegation Name
+    /// [RFC 6672](https://tools.ietf.org/html/rfc6672) Delegation Name (RData unsupported)
+    DNAME,
     /// [RFC 7477](https://tools.ietf.org/html/rfc4034) Child-to-parent synchronization record
     CSYNC,
     /// [RFC 4034](https://tools.ietf.org/html/rfc4034) DNS Key record: RSASHA256 and RSASHA512, RFC5702
@@ -63,7 +65,7 @@ pub enum RecordType {
     /// [RFC 1035](https://tools.ietf.org/html/rfc1035) host information
     HINFO,
     //  HIP,        // 55 RFC 5205 Host Identity Protocol
-    /// [RFC draft-ietf-dnsop-svcb-https-03](https://tools.ietf.org/html/draft-ietf-dnsop-svcb-httpssvc-03) DNS SVCB and HTTPS RRs
+    /// [RFC 9460](https://tools.ietf.org/html/rfc9460) DNS SVCB and HTTPS RRs
     HTTPS,
     //  IPSECKEY,   // 45 RFC 4025 IPsec Key
     /// [RFC 1996](https://tools.ietf.org/html/rfc1996) Incremental Zone Transfer
@@ -97,13 +99,15 @@ pub enum RecordType {
     RRSIG,
     /// [RFC 2535](https://tools.ietf.org/html/rfc2535) (and [RFC 2931](https://tools.ietf.org/html/rfc2931)) Signature, to support [RFC 2137](https://tools.ietf.org/html/rfc2137) Update.
     SIG,
+    /// [RFC 8162](https://datatracker.ietf.org/doc/html/rfc8162)
+    SMIMEA,
     /// [RFC 1035](https://tools.ietf.org/html/rfc1035) and [RFC 2308](https://tools.ietf.org/html/rfc2308) Start of [a zone of] authority record
     SOA,
     /// [RFC 2782](https://tools.ietf.org/html/rfc2782) Service locator
     SRV,
     /// [RFC 4255](https://tools.ietf.org/html/rfc4255) SSH Public Key Fingerprint
     SSHFP,
-    /// [RFC draft-ietf-dnsop-svcb-https-03](https://tools.ietf.org/html/draft-ietf-dnsop-svcb-httpssvc-03) DNS SVCB and HTTPS RRs
+    /// [RFC 9460](https://tools.ietf.org/html/rfc9460) DNS SVCB and HTTPS RRs
     SVCB,
     //  TA,         // 32768 N/A DNSSEC Trust Authorities
     //  TKEY,       // 249 RFC 2930 Secret key record
@@ -125,6 +129,12 @@ impl RecordType {
     #[inline]
     pub fn is_any(self) -> bool {
         self == Self::ANY
+    }
+
+    /// Returns true if this is a CERT
+    #[inline]
+    pub fn is_cert(self) -> bool {
+        self == Self::CERT
     }
 
     /// Returns true if this is a CNAME
@@ -176,6 +186,12 @@ impl RecordType {
         )
     }
 
+    /// Returns true if this is an RRSIG RecordType
+    #[inline]
+    pub fn is_rrsig(self) -> bool {
+        self == Self::RRSIG
+    }
+
     /// Returns true if this is a Zero (unspecified) RecordType
     #[inline]
     pub fn is_zero(self) -> bool {
@@ -184,20 +200,18 @@ impl RecordType {
 }
 
 impl FromStr for RecordType {
-    type Err = ProtoError;
+    type Err = DecodeError;
 
     /// Convert `&str` to `RecordType`
     ///
     /// ```
     /// use std::str::FromStr;
-    /// use hickory_proto::rr::record_type::RecordType;
+    /// use hickory_proto::rr::RecordType;
     ///
     /// let var: RecordType = RecordType::from_str("A").unwrap();
     /// assert_eq!(RecordType::A, var);
     /// ```
-    fn from_str(str: &str) -> ProtoResult<Self> {
-        // TODO missing stuff?
-        debug_assert!(str.chars().all(|x| !char::is_ascii_lowercase(&x)));
+    fn from_str(str: &str) -> Result<Self, Self::Err> {
         match str {
             "A" => Ok(Self::A),
             "AAAA" => Ok(Self::AAAA),
@@ -205,9 +219,11 @@ impl FromStr for RecordType {
             "AXFR" => Ok(Self::AXFR),
             "CAA" => Ok(Self::CAA),
             "CDNSKEY" => Ok(Self::CDNSKEY),
+            "CERT" => Ok(Self::CERT),
             "CDS" => Ok(Self::CDS),
             "CNAME" => Ok(Self::CNAME),
             "CSYNC" => Ok(Self::CSYNC),
+            "DNAME" => Ok(Self::DNAME),
             "DNSKEY" => Ok(Self::DNSKEY),
             "DS" => Ok(Self::DS),
             "HINFO" => Ok(Self::HINFO),
@@ -224,6 +240,7 @@ impl FromStr for RecordType {
             "PTR" => Ok(Self::PTR),
             "RRSIG" => Ok(Self::RRSIG),
             "SIG" => Ok(Self::SIG),
+            "SMIMEA" => Ok(Self::SMIMEA),
             "SOA" => Ok(Self::SOA),
             "SRV" => Ok(Self::SRV),
             "SSHFP" => Ok(Self::SSHFP),
@@ -232,7 +249,7 @@ impl FromStr for RecordType {
             "TXT" => Ok(Self::TXT),
             "TSIG" => Ok(Self::TSIG),
             "ANY" | "*" => Ok(Self::ANY),
-            _ => Err(ProtoErrorKind::UnknownRecordTypeStr(str.to_string()).into()),
+            _ => Err(DecodeError::UnknownRecordTypeStr(str.to_owned())),
         }
     }
 }
@@ -241,7 +258,7 @@ impl From<u16> for RecordType {
     /// Convert from `u16` to `RecordType`
     ///
     /// ```
-    /// use hickory_proto::rr::record_type::RecordType;
+    /// use hickory_proto::rr::RecordType;
     ///
     /// let var = RecordType::from(1);
     /// assert_eq!(RecordType::A, var);
@@ -258,8 +275,10 @@ impl From<u16> for RecordType {
             257 => Self::CAA,
             59 => Self::CDS,
             60 => Self::CDNSKEY,
+            37 => Self::CERT,
             5 => Self::CNAME,
             62 => Self::CSYNC,
+            39 => Self::DNAME,
             48 => Self::DNSKEY,
             43 => Self::DS,
             13 => Self::HINFO,
@@ -277,6 +296,7 @@ impl From<u16> for RecordType {
             12 => Self::PTR,
             46 => Self::RRSIG,
             24 => Self::SIG,
+            53 => Self::SMIMEA,
             6 => Self::SOA,
             33 => Self::SRV,
             44 => Self::SSHFP,
@@ -293,18 +313,18 @@ impl From<u16> for RecordType {
 
 impl BinEncodable for RecordType {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u16((*self).into())
+        u16::from(*self).emit(encoder)
     }
 }
 
-impl<'r> BinDecodable<'r> for RecordType {
-    fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<Self> {
-        Ok(decoder
+impl BinDecodable<'_> for RecordType {
+    fn read(decoder: &mut BinDecoder<'_>) -> Result<Self, DecodeError> {
+        decoder
             .read_u16()
             .map(
                 Restrict::unverified, /*RecordType is safe with any u16*/
             )
-            .map(Self::from)?)
+            .map(Self::from)
     }
 }
 
@@ -313,7 +333,7 @@ impl<'r> BinDecodable<'r> for RecordType {
 /// Convert from `RecordType` to `&str`
 ///
 /// ```
-/// use hickory_proto::rr::record_type::RecordType;
+/// use hickory_proto::rr::RecordType;
 ///
 /// let var: &'static str = From::from(RecordType::A);
 /// assert_eq!("A", var);
@@ -331,9 +351,11 @@ impl From<RecordType> for &'static str {
             RecordType::AXFR => "AXFR",
             RecordType::CAA => "CAA",
             RecordType::CDNSKEY => "CDNSKEY",
+            RecordType::CERT => "CERT",
             RecordType::CDS => "CDS",
             RecordType::CNAME => "CNAME",
             RecordType::CSYNC => "CSYNC",
+            RecordType::DNAME => "DNAME",
             RecordType::DNSKEY => "DNSKEY",
             RecordType::DS => "DS",
             RecordType::HINFO => "HINFO",
@@ -352,6 +374,7 @@ impl From<RecordType> for &'static str {
             RecordType::PTR => "PTR",
             RecordType::RRSIG => "RRSIG",
             RecordType::SIG => "SIG",
+            RecordType::SMIMEA => "SMIMEA",
             RecordType::SOA => "SOA",
             RecordType::SRV => "SRV",
             RecordType::SSHFP => "SSHFP",
@@ -368,7 +391,7 @@ impl From<RecordType> for &'static str {
 /// Convert from `RecordType` to `u16`
 ///
 /// ```
-/// use hickory_proto::rr::record_type::RecordType;
+/// use hickory_proto::rr::RecordType;
 ///
 /// let var: u16 = RecordType::A.into();
 /// assert_eq!(1, var);
@@ -384,9 +407,11 @@ impl From<RecordType> for u16 {
             RecordType::AXFR => 252,
             RecordType::CAA => 257,
             RecordType::CDNSKEY => 60,
+            RecordType::CERT => 37,
             RecordType::CDS => 59,
             RecordType::CNAME => 5,
             RecordType::CSYNC => 62,
+            RecordType::DNAME => 39,
             RecordType::DNSKEY => 48,
             RecordType::DS => 43,
             RecordType::HINFO => 13,
@@ -405,6 +430,7 @@ impl From<RecordType> for u16 {
             RecordType::PTR => 12,
             RecordType::RRSIG => 46,
             RecordType::SIG => 24,
+            RecordType::SMIMEA => 53,
             RecordType::SOA => 6,
             RecordType::SRV => 33,
             RecordType::SSHFP => 44,
@@ -442,6 +468,10 @@ impl Display for RecordType {
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
+    use alloc::string::ToString;
+    #[cfg(feature = "std")]
+    use std::println;
+
     use super::*;
 
     #[test]
@@ -458,6 +488,7 @@ mod tests {
             RecordType::TXT,
             RecordType::AAAA,
             RecordType::SRV,
+            RecordType::CERT,
             RecordType::CSYNC,
             RecordType::AXFR,
             RecordType::ANY,
@@ -474,6 +505,7 @@ mod tests {
             RecordType::PTR,
             RecordType::MX,
             RecordType::CNAME,
+            RecordType::CERT,
             RecordType::TXT,
             RecordType::AAAA,
             RecordType::HINFO,
@@ -482,6 +514,7 @@ mod tests {
 
         unordered.sort();
 
+        #[cfg(feature = "std")]
         for rtype in unordered.clone() {
             println!("u16 for {:?}: {}", rtype, u16::from(rtype));
         }
@@ -498,6 +531,7 @@ mod tests {
             "AAAA",
             "ANAME",
             "CAA",
+            "CERT",
             "CNAME",
             "CSYNC",
             "HINFO",
@@ -507,6 +541,7 @@ mod tests {
             "NS",
             "OPENPGPKEY",
             "PTR",
+            "SMIMEA",
             "SOA",
             "SRV",
             "SSHFP",
@@ -516,7 +551,7 @@ mod tests {
             "AXFR",
         ];
 
-        #[cfg(feature = "dnssec")]
+        #[cfg(feature = "__dnssec")]
         let dnssec_record_names = &[
             "CDNSKEY",
             "CDS",
@@ -530,10 +565,13 @@ mod tests {
             "SIG",
             "TSIG",
         ];
-        #[cfg(not(feature = "dnssec"))]
+        #[cfg(not(feature = "__dnssec"))]
         let dnssec_record_names = &[];
 
+        #[cfg(feature = "std")]
         let mut rtypes = std::collections::HashSet::new();
+        #[cfg(not(feature = "std"))]
+        let mut rtypes = alloc::collections::BTreeSet::new();
         for name in record_names.iter().chain(dnssec_record_names) {
             let rtype: RecordType = name.parse().unwrap();
             assert_eq!(rtype.to_string().to_ascii_uppercase().as_str(), *name);
@@ -544,6 +582,9 @@ mod tests {
     #[test]
     fn check_record_type_parse_wont_panic_with_symbols() {
         let dns_class = "a-b-c".to_ascii_uppercase().parse::<RecordType>();
-        assert!(matches!(&dns_class, Err(ProtoError { .. })));
+        assert!(matches!(
+            &dns_class,
+            Err(DecodeError::UnknownRecordTypeStr(_))
+        ));
     }
 }

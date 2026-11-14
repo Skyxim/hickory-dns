@@ -1,28 +1,25 @@
+directory = "/var/named"
+
 ## Default zones, these should be present on all nameservers, except in rare
 ##  configuration cases
 [[zones]]
 zone = "localhost"
-zone_type = "Primary"
 file = "default/localhost.zone"
 
 [[zones]]
 zone = "0.0.127.in-addr.arpa"
-zone_type = "Primary"
 file = "default/127.0.0.1.zone"
 
 [[zones]]
 zone = "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa"
-zone_type = "Primary"
 file = "default/ipv6_1.zone"
 
 [[zones]]
 zone = "255.in-addr.arpa"
-zone_type = "Primary"
 file = "default/255.zone"
 
 [[zones]]
 zone = "0.in-addr.arpa"
-zone_type = "Primary"
 file = "default/0.zone"
 
 [[zones]]
@@ -32,10 +29,28 @@ file = "default/0.zone"
 ##  queries for "www.example.com" or "example.com" would be forwarded.
 zone = "."
 
-## zone_type: Primary, Secondary, Hint, Forward
-zone_type = "Forward"
-
 ## remember the port, defaults: 53 for Udp & Tcp, 853 for Tls and 443 for Https.
-##   Tls and/or Https require features dns-over-tls and/or dns-over-https
-stores = { type = "forward", name_servers = [{ socket_addr = "8.8.8.8:53", protocol = "udp", trust_nx_responses = false },
-                                             { socket_addr = "8.8.8.8:53", protocol = "tcp", trust_nx_responses = false }] }
+##   Tls and/or Https require features tls-aws-lc-rs, tls-ring, https-aws-lc-rs and/or https-ring.
+[zones.stores]
+type = "forward"
+
+[[zones.stores.name_servers]]
+ip = "8.8.8.8"
+trust_negative_responses = false
+## protocol is either a plain string ("udp" or "tcp") or a table, e.g. { type = "tls", server_name = "..." }
+connections = [
+    { protocol = "udp" },
+    { protocol = { type = "tcp" } },
+]
+
+[zones.stores.options]
+timeout = 20
+positive_max_ttl = 3600
+negative_max_ttl = 3600
+edns_payload_len = 1232
+## These options set the answer filter for the forwarder.  Anything listed in deny_answers will be
+## blocked.  If you need to add a granular exception, you can place an address in allow_answers -
+## that will override something in deny_answers.  For example, the following configuration blocks
+## any record containing an RFC-1918 address *except* 192.168.1.1.
+#allow_answers = ["192.168.1.1/32"]
+#deny_answers = ["10.0.0.0/8", "172.16.0.0/12", "192.168.1.0/24"]

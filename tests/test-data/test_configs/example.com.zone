@@ -1,10 +1,11 @@
 ; replace the hickory-dns.org with your own name
+$TTL 24h
 @   IN          SOA     hickory-dns.org. root.hickory-dns.org. (
                                 199609203 ; Serial
                                 8h        ; Refresh
                                 120m      ; Retry
                                 7d        ; Expire
-                                24h)      ; Minimum TTL
+                                24h)      ; Negative response caching TTL
 
                 NS      bbb
 
@@ -28,6 +29,13 @@ server          SRV     1 1 443 alias
 
 *.wildcard      CNAME   www
 
+*.awildcard     A       127.0.0.4
+
 no-service 86400 IN MX 0 .
 
 $INCLUDE include.example.com.zone
+
+$TTL 900
+
+shortlived      A       127.0.0.1
+                AAAA    ::1

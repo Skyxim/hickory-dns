@@ -1,0 +1,688 @@
+use std::{
+    cmp,
+    collections::{HashMap, VecDeque, hash_map::Entry},
+    future::{Future, ready},
+    io::{self, Write},
+    iter,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::Pin,
+    sync::{Arc, Mutex, Once},
+    task::{Context, Poll, Waker},
+    time::Duration,
+};
+
+use bytes::Buf;
+use futures_util::{AsyncRead, AsyncWrite};
+use hickory_net::{
+    runtime::{DnsTcpStream, DnsUdpSocket, RuntimeProvider, TokioHandle, TokioTime},
+    tls::default_provider,
+    xfer::Protocol,
+};
+use hickory_proto::{
+    op::{Message, OpCode, Query, ResponseCode},
+    rr::{
+        Name, RData, Record, RecordType,
+        rdata::{A, CNAME, NS, SOA, TXT},
+    },
+    serialize::binary::BinDecodable,
+};
+use metrics::{IntoLabels, Key, KeyName, SharedString, Unit};
+use metrics_util::{CompositeKey, MetricKind, debugging::DebugValue};
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, CertifiedIssuer, DnType,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+};
+use rustls::{pki_types::PrivatePkcs8KeyDer, sign::CertifiedKey};
+use tracing::{error, info};
+
+/// Registers a global default tracing subscriber when called for the first time. This is intended
+/// for use in tests.
+pub fn subscribe() {
+    static INSTALL_TRACING_SUBSCRIBER: Once = Once::new();
+    INSTALL_TRACING_SUBSCRIBER.call_once(|| {
+        let subscriber = tracing_subscriber::FmtSubscriber::builder()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    });
+}
+
+/// This is a writer that can be used with a thread-local tracing subscriber to inspect
+/// logs for a single test.
+#[derive(Clone)]
+pub struct LogWriter(pub Arc<Mutex<Vec<u8>>>);
+
+impl LogWriter {
+    pub fn contains(&self, needle: &str) -> bool {
+        self.logs().contains(needle)
+    }
+
+    pub fn logs(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        print!("{}", String::from_utf8(buf.to_vec()).unwrap());
+        self.0.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
+/// A builder for a mock response message to be returned by the [`MockHandler`].
+#[derive(Clone)]
+pub struct MockResponse {
+    /// The IP address of the mock name server that sends this response.
+    ///
+    /// This is used when matching queries against mock responses.
+    pub server_ip: IpAddr,
+    /// The mock response message to be sent in reply to queries.
+    ///
+    /// The question section of the message is used when matching queries against mock responses.
+    pub message: Message,
+
+    /// TTL to be used in records added by convenience methods.
+    ttl: u32,
+}
+
+impl MockResponse {
+    pub fn new(server_ip: impl Into<IpAddr>, query_name: &Name, query_type: RecordType) -> Self {
+        let mut message = Message::response(0, OpCode::Query);
+        message.add_query(Query::new(query_name.clone(), query_type));
+        message.metadata.authoritative = true;
+        Self {
+            server_ip: server_ip.into(),
+            message,
+            ttl: Self::DEFAULT_TTL,
+        }
+    }
+
+    /// Set the TTL of records added by subsequent method calls.
+    pub fn with_ttl(self, ttl: u32) -> Self {
+        Self { ttl, ..self }
+    }
+
+    /// Set the response code.
+    pub fn with_response_code(mut self, response_code: ResponseCode) -> Self {
+        self.message.metadata.response_code = response_code;
+        self
+    }
+
+    /// Set the truncation flag.
+    pub fn with_tc(mut self, truncation: bool) -> Self {
+        self.message.metadata.truncation = truncation;
+        self
+    }
+
+    /// Set the authoritative answer flag.
+    pub fn with_aa(mut self, authoritative_answer: bool) -> Self {
+        self.message.metadata.authoritative = authoritative_answer;
+        self
+    }
+
+    /// Add an A record to the answer section.
+    pub fn a(self, name: &Name, ip_address: Ipv4Addr) -> Self {
+        self.add_answer(name, RData::A(A(ip_address)))
+    }
+
+    /// Add an A record to the additional section.
+    pub fn a_glue(self, name: &Name, ip_address: Ipv4Addr) -> Self {
+        self.add_additional(name, RData::A(A(ip_address)))
+    }
+
+    /// Add a CNAME record to the answer section.
+    pub fn cname(self, name: &Name, target: &Name) -> Self {
+        self.add_answer(name, RData::CNAME(CNAME(target.clone())))
+    }
+
+    /// Add an NS record to the answer section.
+    pub fn ns_answer(self, name: &Name, nameserver: &Name) -> Self {
+        self.add_answer(name, RData::NS(NS(nameserver.clone())))
+    }
+
+    /// Add an NS record to the authority section.
+    pub fn ns_referral(self, name: &Name, nameserver: &Name) -> Self {
+        self.add_authority(name, RData::NS(NS(nameserver.clone())))
+    }
+
+    /// Add an SOA record to the answer section.
+    pub fn soa_answer(self, name: &Name, mname: &Name, rname: &Name) -> Self {
+        self.add_answer(
+            name,
+            RData::SOA(SOA::new(mname.clone(), rname.clone(), 1, 1, 1, 1, 1)),
+        )
+    }
+
+    /// Add an SOA record to the authority section.
+    pub fn soa_authority(self, name: &Name, mname: &Name, rname: &Name) -> Self {
+        self.add_authority(
+            name,
+            RData::SOA(SOA::new(mname.clone(), rname.clone(), 1, 1, 1, 1, 1)),
+        )
+    }
+
+    /// Add a TXT record to the answer section.
+    pub fn txt(self, name: &Name, string: String) -> Self {
+        self.add_answer(
+            name,
+            RData::TXT(TXT::new(iter::once(string.into_boxed_str())).unwrap()),
+        )
+    }
+
+    /// Add a record to the answer section.
+    pub fn add_answer(mut self, name: &Name, rdata: RData) -> Self {
+        self.message
+            .add_answer(Record::from_rdata(name.clone(), self.ttl, rdata));
+        self
+    }
+
+    /// Add a record to the authority section.
+    pub fn add_authority(mut self, name: &Name, rdata: RData) -> Self {
+        self.message
+            .add_authority(Record::from_rdata(name.clone(), self.ttl, rdata));
+        self
+    }
+
+    /// Add a record to the additional section.
+    pub fn add_additional(mut self, name: &Name, rdata: RData) -> Self {
+        self.message
+            .add_additional(Record::from_rdata(name.clone(), self.ttl, rdata));
+        self
+    }
+
+    const DEFAULT_TTL: u32 = 3600;
+}
+
+/// Request handling functionality that can be plugged into [`MockProvider`].
+pub trait MockHandler {
+    /// Takes in a request message and produces a response message.
+    fn handle(&self, destination: IpAddr, protocol: Protocol, request: Message) -> Message;
+}
+
+/// Type alias for a closure that can modify the handler on a per-test basis.
+pub type MockMutator = Box<dyn Fn(IpAddr, Protocol, &mut Message) + Send + Sync + 'static>;
+
+/// Handler that stands in for multiple authoritative name servers, with specific canned responses.
+pub struct MockNetworkHandler {
+    responses: HashMap<IpAddr, HashMap<Query, Message>>,
+    mutate: MockMutator,
+}
+
+impl MockNetworkHandler {
+    /// Return a [`MockNetworkHandler`] that will respond to queries with answers from the provided
+    /// mock responses.
+    pub fn new(responses: Vec<MockResponse>) -> Self {
+        let mut hashed_responses = HashMap::<IpAddr, HashMap<Query, Message>>::new();
+        for response in responses {
+            let server_map = hashed_responses.entry(response.server_ip).or_default();
+            let query = response.message.queries[0].clone();
+            match server_map.entry(query) {
+                Entry::Occupied(_) => {
+                    panic!(
+                        "duplicate mock responses provided for {:?}",
+                        response.message.queries[0]
+                    );
+                }
+                Entry::Vacant(vacant_entry) => {
+                    vacant_entry.insert(response.message);
+                }
+            }
+        }
+
+        Self {
+            responses: hashed_responses,
+            mutate: Box::new(
+                |_destination: IpAddr, _protocol: Protocol, _message: &mut Message| {},
+            ),
+        }
+    }
+
+    pub fn with_mutation(mut self, mutate: MockMutator) -> Self {
+        self.mutate = mutate;
+        self
+    }
+}
+
+impl MockHandler for MockNetworkHandler {
+    fn handle(&self, destination: IpAddr, protocol: Protocol, request: Message) -> Message {
+        let Some(server_responses) = self.responses.get(&destination) else {
+            error!(%destination, "unexpected destination IP address");
+            let mut msg = request.into_response();
+            msg.metadata.response_code = ResponseCode::ServFail;
+            return msg;
+        };
+        let query = &request.queries[0];
+        info!(%destination, %query, "handling request");
+        let Some(response) = server_responses.get(query) else {
+            error!(%query, "unexpected query");
+            let mut msg = request.into_response();
+            msg.metadata.response_code = ResponseCode::ServFail;
+            return msg;
+        };
+        let mut response = response.clone();
+        response.metadata.id = request.id;
+        response.queries.clear();
+        response.add_query(query.clone());
+
+        (self.mutate)(destination, protocol, &mut response);
+        response
+    }
+}
+
+#[derive(Clone)]
+pub struct MockProvider {
+    handler: Arc<dyn MockHandler + Send + Sync>,
+    new_connection_calls: Arc<Mutex<Vec<(IpAddr, Protocol)>>>,
+    tokio_handle: TokioHandle,
+    queries: MockQueryCache,
+}
+
+impl MockProvider {
+    pub fn new(handler: impl MockHandler + Send + Sync + 'static) -> Self {
+        Self {
+            handler: Arc::new(handler),
+            new_connection_calls: Arc::new(Mutex::new(vec![])),
+            tokio_handle: TokioHandle::default(),
+            queries: MockQueryCache::new(),
+        }
+    }
+
+    pub fn new_connection_calls(&self) -> Vec<(IpAddr, Protocol)> {
+        self.new_connection_calls.lock().unwrap().clone()
+    }
+
+    pub fn count_new_connection_calls(&self, ip: IpAddr, protocol: Protocol) -> usize {
+        self.new_connection_calls()
+            .iter()
+            .filter(|(ns_ip, proto)| *ns_ip == ip && *proto == protocol)
+            .collect::<Vec<_>>()
+            .len()
+    }
+
+    /// This returns all queries sent to a mock nameserver
+    pub fn queries(&self, ip: &IpAddr) -> Vec<Query> {
+        self.queries.get(ip)
+    }
+}
+
+impl RuntimeProvider for MockProvider {
+    type Handle = TokioHandle;
+
+    type Timer = TokioTime;
+
+    type Udp = MockUdpSocket;
+
+    type Tcp = MockTcpStream;
+
+    fn create_handle(&self) -> Self::Handle {
+        self.tokio_handle.clone()
+    }
+
+    fn connect_tcp(
+        &self,
+        server_addr: SocketAddr,
+        _bind_addr: Option<SocketAddr>,
+        _timeout: Option<Duration>,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Tcp, io::Error>> + Send>> {
+        self.new_connection_calls
+            .lock()
+            .unwrap()
+            .push((server_addr.ip(), Protocol::Tcp));
+        Box::pin(ready(Ok(MockTcpStream::new(
+            self.handler.clone(),
+            server_addr.ip(),
+            self.queries.clone(),
+        ))))
+    }
+
+    fn bind_udp(
+        &self,
+        _local_addr: SocketAddr,
+        server_addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Udp, io::Error>> + Send>> {
+        self.new_connection_calls
+            .lock()
+            .unwrap()
+            .push((server_addr.ip(), Protocol::Udp));
+        Box::pin(ready(Ok(MockUdpSocket::new(
+            self.handler.clone(),
+            self.queries.clone(),
+        ))))
+    }
+}
+
+pub struct MockUdpSocket {
+    inner: Mutex<MockUdpSocketInner>,
+    handler: Arc<dyn MockHandler + Send + Sync + 'static>,
+    queries: MockQueryCache,
+}
+
+pub struct MockUdpSocketInner {
+    /// Response messages ready to be returned to the client.
+    incoming_datagrams: VecDeque<(Message, SocketAddr)>,
+    /// Waker from the last call to [`DnsUdpSocket::poll_recv_from()`], if it returned `Pending`.
+    waker: Option<Waker>,
+}
+
+impl MockUdpSocket {
+    pub fn new(
+        handler: Arc<dyn MockHandler + Send + Sync + 'static>,
+        queries: MockQueryCache,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(MockUdpSocketInner {
+                incoming_datagrams: VecDeque::new(),
+                waker: None,
+            }),
+            handler,
+            queries,
+        }
+    }
+}
+
+impl DnsUdpSocket for MockUdpSocket {
+    type Time = TokioTime;
+
+    fn poll_recv_from(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<(usize, SocketAddr)>> {
+        let mut guard = self.inner.lock().unwrap();
+        let Some((message, socket_addr)) = guard.incoming_datagrams.pop_front() else {
+            guard.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        };
+
+        let encoded = match message.to_vec() {
+            Ok(vec) => vec,
+            Err(error) => {
+                error!(%error, "encoding response message failed");
+                return Poll::Ready(Err(io::Error::other(error)));
+            }
+        };
+        buf[..encoded.len()].copy_from_slice(&encoded);
+        Poll::Ready(Ok((encoded.len(), socket_addr)))
+    }
+
+    fn poll_send_to(
+        &self,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let request = match Message::from_bytes(buf) {
+            Ok(message) => message,
+            Err(error) => {
+                error!(%error, "decoding request message failed");
+                return Poll::Ready(Err(io::Error::other(error)));
+            }
+        };
+
+        self.queries.insert(target.ip(), request.queries[0].clone());
+        let response = self.handler.handle(target.ip(), Protocol::Udp, request);
+
+        let mut guard = self.inner.lock().unwrap();
+        guard.incoming_datagrams.push_back((response, target));
+
+        if let Some(waker) = guard.waker.take() {
+            waker.wake();
+        }
+
+        Poll::Ready(Ok(buf.len()))
+    }
+}
+
+pub struct MockTcpStream {
+    inner: Mutex<MockTcpStreamInner>,
+    destination: IpAddr,
+    handler: Arc<dyn MockHandler + Send + Sync + 'static>,
+    queries: MockQueryCache,
+}
+
+struct MockTcpStreamInner {
+    /// Buffered stream data, from the client to the mocked server.
+    ///
+    /// This is produced via [`AsyncWrite::poll_write()`], and consumed whenever a full message has
+    /// been buffered.
+    outgoing_buffer: VecDeque<u8>,
+    /// Buffered stream data, from the mocked server back to the client.
+    ///
+    /// This is consumed via [`AsyncRead::poll_read()`].
+    incoming_buffer: VecDeque<u8>,
+    /// Waker from the last call to [`AsyncRead::poll_read()`], if it returned `Pending`.
+    waker: Option<Waker>,
+}
+
+impl MockTcpStream {
+    fn new(
+        handler: Arc<dyn MockHandler + Send + Sync + 'static>,
+        destination: IpAddr,
+        queries: MockQueryCache,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(MockTcpStreamInner {
+                outgoing_buffer: VecDeque::new(),
+                incoming_buffer: VecDeque::new(),
+                waker: None,
+            }),
+            destination,
+            handler,
+            queries,
+        }
+    }
+}
+
+impl DnsTcpStream for MockTcpStream {
+    type Time = TokioTime;
+}
+
+impl AsyncRead for MockTcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut guard = self.inner.lock().unwrap();
+        let len = guard.incoming_buffer.len();
+        if len == 0 {
+            guard.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let clamped_len = cmp::min(len, buf.len());
+        guard.incoming_buffer.copy_to_slice(&mut buf[..clamped_len]);
+        Poll::Ready(Ok(clamped_len))
+    }
+}
+
+impl AsyncWrite for MockTcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.outgoing_buffer.extend(buf);
+
+        let mut any_writes = false;
+        while guard.outgoing_buffer.len() >= 2 {
+            let request_length_prefix = u16::from_be_bytes([
+                *guard.outgoing_buffer.front().unwrap(),
+                *guard.outgoing_buffer.get(1).unwrap(),
+            ]);
+            if guard.outgoing_buffer.len() < 2 + request_length_prefix as usize {
+                break;
+            }
+
+            guard.outgoing_buffer.advance(2);
+            let mut message_buf = vec![0u8; request_length_prefix as usize];
+            guard.outgoing_buffer.copy_to_slice(&mut message_buf);
+
+            let request = match Message::from_bytes(&message_buf) {
+                Ok(message) => message,
+                Err(error) => {
+                    error!(%error, "decoding request message failed");
+                    return Poll::Ready(Err(io::Error::other(error)));
+                }
+            };
+
+            self.queries
+                .insert(self.destination, request.queries[0].clone());
+            let response = self
+                .handler
+                .handle(self.destination, Protocol::Tcp, request);
+
+            let encoded = match response.to_vec() {
+                Ok(vec) => vec,
+                Err(error) => {
+                    error!(%error, "encoding response message failed");
+                    return Poll::Ready(Err(io::Error::other(error)));
+                }
+            };
+
+            guard
+                .incoming_buffer
+                .extend(u16::to_be_bytes(u16::try_from(encoded.len()).unwrap()));
+            guard.incoming_buffer.extend(&encoded);
+
+            any_writes = true;
+        }
+
+        if any_writes {
+            if let Some(waker) = guard.waker.take() {
+                waker.wake();
+            }
+        }
+
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Clone)]
+pub struct MockQueryCache(Arc<Mutex<HashMap<IpAddr, Vec<Query>>>>);
+
+impl MockQueryCache {
+    fn get(&self, ip: &IpAddr) -> Vec<Query> {
+        self.0.lock().unwrap().get(ip).cloned().unwrap_or_default()
+    }
+
+    fn insert(&self, ip: IpAddr, query: Query) {
+        self.0.lock().unwrap().entry(ip).or_default().push(query);
+    }
+
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(HashMap::new())))
+    }
+}
+
+pub fn assert_histogram_sample_count_eq(
+    map: &HashMap<CompositeKey, (Option<Unit>, Option<SharedString>, DebugValue)>,
+    name: impl Into<KeyName>,
+    labels: impl IntoLabels,
+    expected_sample_count: u64,
+    expected_unit: Unit,
+) {
+    let key = CompositeKey::new(MetricKind::Histogram, Key::from_parts(name, labels));
+    let (unit_opt, desc, value) = map
+        .get(&key)
+        .unwrap_or_else(|| panic!("no observations for metric: {key:?}"));
+    assert_eq!(unit_opt, &Some(expected_unit), "metric: {key:?}");
+    assert!(desc.is_some(), "missing description for metric: {key:?}");
+    if let DebugValue::Histogram(samples) = value {
+        assert_eq!(
+            samples.len(),
+            expected_sample_count as usize,
+            "metric: {key:?}"
+        );
+    } else {
+        panic!("expected histogram value, got {value:?}");
+    }
+}
+
+pub fn assert_counter_eq(
+    map: &HashMap<CompositeKey, (Option<Unit>, Option<SharedString>, DebugValue)>,
+    name: impl Into<KeyName>,
+    labels: impl IntoLabels,
+    expected: u64,
+) {
+    let key = CompositeKey::new(MetricKind::Counter, Key::from_parts(name, labels));
+    let (unit_opt, desc, value) = map
+        .get(&key)
+        .unwrap_or_else(|| panic!("no observations for metric: {key:?}"));
+    assert_eq!(unit_opt, &Some(Unit::Count), "metric: {key:?}");
+    assert!(desc.is_some(), "missing description for metric: {key:?}");
+    assert_eq!(value, &DebugValue::Counter(expected), "metric: {key:?}");
+}
+
+pub fn assert_gauge_eq(
+    map: &HashMap<CompositeKey, (Option<Unit>, Option<SharedString>, DebugValue)>,
+    name: impl Into<KeyName>,
+    labels: impl IntoLabels,
+    expected: u8,
+) {
+    let key = CompositeKey::new(MetricKind::Gauge, Key::from_parts(name, labels));
+    let (unit_opt, desc, value) = map
+        .get(&key)
+        .unwrap_or_else(|| panic!("no observations for metric: {key:?}"));
+    assert_eq!(unit_opt, &Some(Unit::Count), "metric: {key:?}");
+    assert!(desc.is_some(), "missing description for metric: {key:?}");
+    if let DebugValue::Gauge(gauge_val) = value {
+        assert_eq!(gauge_val.into_inner(), expected as f64, "metric: {key:?}");
+    } else {
+        panic!("expected gauge value {expected}, got {value:?}")
+    }
+}
+
+/// A root certificate and a server certificate, for use in tests.
+pub struct TestCertificates {
+    /// Root certificate authority.
+    pub ca: CertifiedIssuer<'static, KeyPair>,
+    /// The server's leaf certificate.
+    pub leaf: Certificate,
+    /// The server's private key.
+    pub key: KeyPair,
+}
+
+impl TestCertificates {
+    /// Generate a root certificate and a server certificate, along with keys.
+    pub fn generate() -> Self {
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "root.example.com");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = Vec::from([
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ]);
+        let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
+
+        let mut leaf_params = CertificateParams::new(["ns.example.com".to_string()]).unwrap();
+        leaf_params.is_ca = IsCa::NoCa;
+        leaf_params.extended_key_usages = Vec::from([ExtendedKeyUsagePurpose::ServerAuth]);
+        let key = KeyPair::generate().unwrap();
+        let leaf = leaf_params.signed_by(&key, &ca).unwrap();
+
+        Self { ca, leaf, key }
+    }
+
+    /// Returns the certificate chain and the server's private key.
+    pub fn certified_key(&self) -> CertifiedKey {
+        let cert_chain = Vec::from([self.leaf.der().to_owned(), self.ca.der().to_owned()]);
+        let private_key_der = PrivatePkcs8KeyDer::from(self.key.serialize_der());
+        CertifiedKey::from_der(cert_chain, private_key_der.into(), &default_provider()).unwrap()
+    }
+}

@@ -6,28 +6,25 @@ on:
       - published
 
 env:
-  CARGO_WS_VERSION: "0.2.42"
+  JUST_VERSION: "1.59.0"
+  CARGO_WS_VERSION: "0.4.2"
 
 jobs:
   publish:
     name: publish
-    # wait for the cache from all-features
-    #  TODO: we really want this:
-    # needs: ./.github/workflows/test/platform-matrix
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - uses: dtolnay/rust-toolchain@stable
 
-    - uses: extractions/setup-just@v2
-
-    - name: cargo install cargo-workspaces
-      uses: baptiste0928/cargo-install@v3
+    - uses: taiki-e/install-action@v2
       with:
-        crate: cargo-workspaces
-        version: ${{ env.CARGO_WS_VERSION }}
+        tool: just@${{ env.JUST_VERSION }}
 
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-workspaces@${{ env.CARGO_WS_VERSION }}
 
     - name: just publish
       env:

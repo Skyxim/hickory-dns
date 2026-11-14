@@ -7,15 +7,19 @@
 
 //! All persistent store implementations
 
-mod config;
+use std::path::{Path, PathBuf};
+
+pub mod blocklist;
 pub mod file;
 pub mod forwarder;
 pub mod in_memory;
 pub mod recursor;
 #[cfg(feature = "sqlite")]
-#[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
 pub mod sqlite;
 
-// TODO: add a dynamic library option?
-
-pub use self::config::StoreConfig;
+pub(crate) fn rooted(file: &Path, root_dir: Option<&Path>) -> PathBuf {
+    match root_dir {
+        Some(root) => root.join(file),
+        None => file.to_owned(),
+    }
+}

@@ -7,15 +7,19 @@
 
 //! HINFO record for storing host information
 
-use std::fmt;
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+};
+use core::fmt;
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::*,
     rr::{RData, RecordData, RecordType},
-    serialize::binary::*,
+    serialize::{binary::*, txt::ParseError},
 };
 
 /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987][rfc1035]
@@ -44,11 +48,15 @@ use crate::{
 /// ```
 ///
 /// [rfc1035]: https://tools.ietf.org/html/rfc1035
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct HINFO {
-    cpu: Box<[u8]>,
-    os: Box<[u8]>,
+    /// A `character-string` which specifies the CPU type.
+    pub cpu: Box<[u8]>,
+
+    /// A `character-string` which specifies the operating system type.
+    pub os: Box<[u8]>,
 }
 
 impl HINFO {
@@ -84,14 +92,24 @@ impl HINFO {
         Self { cpu, os }
     }
 
-    /// A `character-string` which specifies the CPU type.
-    pub fn cpu(&self) -> &[u8] {
-        &self.cpu
-    }
-
-    /// A `character-string` which specifies the operating system type.
-    pub fn os(&self) -> &[u8] {
-        &self.os
+    /// Parse the RData from a set of Tokens
+    ///
+    /// ```text
+    /// IN HINFO DEC-2060 TOPS20
+    /// IN HINFO VAX-11/780 UNIX
+    /// ```
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        mut tokens: I,
+    ) -> Result<Self, ParseError> {
+        let cpu = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("cpu".to_string()))
+            .map(ToString::to_string)?;
+        let os = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("os".to_string()))
+            .map(ToString::to_string)?;
+        Ok(Self::new(cpu, os))
     }
 }
 
@@ -105,7 +123,7 @@ impl BinEncodable for HINFO {
 }
 
 impl<'r> BinDecodable<'r> for HINFO {
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let cpu = decoder.read_character_data()?
         .unverified(/*any data should be validate in HINFO CPU usage*/)
         .to_vec()
@@ -120,13 +138,6 @@ impl<'r> BinDecodable<'r> for HINFO {
 }
 
 impl RecordData for HINFO {
-    fn try_from_rdata(data: RData) -> Result<Self, RData> {
-        match data {
-            RData::HINFO(csync) => Ok(csync),
-            _ => Err(data),
-        }
-    }
-
     fn try_borrow(data: &RData) -> Option<&Self> {
         match data {
             RData::HINFO(csync) => Some(csync),
@@ -170,8 +181,8 @@ impl fmt::Display for HINFO {
         write!(
             f,
             "{cpu} {os}",
-            cpu = &String::from_utf8_lossy(&self.cpu),
-            os = &String::from_utf8_lossy(&self.os)
+            cpu = String::from_utf8_lossy(&self.cpu),
+            os = String::from_utf8_lossy(&self.os)
         )?;
         Ok(())
     }
@@ -180,6 +191,10 @@ impl fmt::Display for HINFO {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
+
+    use alloc::{string::ToString, vec::Vec};
+    #[cfg(feature = "std")]
+    use std::println;
 
     use super::*;
 
@@ -192,6 +207,7 @@ mod tests {
         assert!(rdata.emit(&mut encoder).is_ok());
         let bytes = encoder.into_bytes();
 
+        #[cfg(feature = "std")]
         println!("bytes: {bytes:?}");
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
@@ -212,10 +228,28 @@ mod tests {
         assert!(rdata.emit(&mut encoder).is_ok());
         let bytes = encoder.into_bytes();
 
+        #[cfg(feature = "std")]
         println!("bytes: {bytes:?}");
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
         let read_rdata = HINFO::read(&mut decoder).expect("Decoding error");
         assert_eq!(rdata, read_rdata);
+    }
+
+    #[test]
+    fn test_parsing() {
+        // IN HINFO DEC-2060 TOPS20
+        assert_eq!(
+            HINFO::from_tokens(vec!["DEC-2060", "TOPS20"].into_iter())
+                .expect("failed to parse NAPTR"),
+            HINFO::new("DEC-2060".to_string(), "TOPS20".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_parsing_fails() {
+        // IN HINFO DEC-2060 TOPS20
+        assert!(HINFO::from_tokens(vec!["DEC-2060"].into_iter()).is_err());
+        assert!(HINFO::from_tokens(vec![].into_iter()).is_err());
     }
 }

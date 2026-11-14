@@ -9,20 +9,18 @@
 //!
 //! A label is stored internally as ascii, where all unicode characters are converted to punycode internally.
 
-#[allow(clippy::useless_attribute)]
-#[allow(unused)]
-#[allow(deprecated)]
-use std::ascii::AsciiExt;
-use std::borrow::Borrow;
-use std::cmp::{Ordering, PartialEq};
-use std::fmt::{self, Debug, Display, Formatter, Write};
-use std::hash::{Hash, Hasher};
-use tinyvec::TinyVec;
+use alloc::{string::String, vec::Vec};
+use core::borrow::Borrow;
+use core::cmp::{Ordering, PartialEq};
+use core::fmt::{self, Debug, Display, Formatter, Write};
+use core::hash::{Hash, Hasher};
 
-use idna;
+use idna::uts46::{AsciiDenyList, DnsLength, Hyphens, Uts46};
+use tinyvec::TinyVec;
 use tracing::debug;
 
 use crate::error::*;
+use crate::serialize::binary::DecodeError;
 
 const WILDCARD: &[u8] = b"*";
 const IDNA_PREFIX: &[u8] = b"xn--";
@@ -44,7 +42,7 @@ impl Label {
             return Err("Label requires a minimum length of 1".into());
         }
         if bytes.len() > 63 {
-            return Err(ProtoErrorKind::LabelBytesTooLong(bytes.len()).into());
+            return Err(DecodeError::LabelBytesTooLong(bytes.len()).into());
         };
         Ok(Self(TinyVec::from(bytes)))
     }
@@ -60,15 +58,15 @@ impl Label {
             return Self::from_ascii(s);
         }
 
-        match idna::Config::default()
-            .use_std3_ascii_rules(true)
-            .transitional_processing(true)
-            // length don't exceding 63 is done in `from_ascii`
-            // on puny encoded string
-            // idna error are opaque so early failure is not possible.
-            .verify_dns_length(false)
-            .to_ascii(s)
-        {
+        // length don't exceeding 63 is done in `from_ascii`
+        // on puny encoded string
+        // idna error are opaque so early failure is not possible.
+        match Uts46::new().to_ascii(
+            s.as_bytes(),
+            AsciiDenyList::STD3,
+            Hyphens::Allow,
+            DnsLength::Ignore,
+        ) {
             Ok(puny) => Self::from_ascii(&puny),
             e => Err(format!("Label contains invalid characters: {e:?}").into()),
         }
@@ -79,7 +77,7 @@ impl Label {
     /// This will return an Error if the label is not an ascii string
     pub fn from_ascii(s: &str) -> ProtoResult<Self> {
         if s.len() > 63 {
-            return Err(ProtoErrorKind::LabelBytesTooLong(s.len()).into());
+            return Err(DecodeError::LabelBytesTooLong(s.len()).into());
         }
 
         if s.as_bytes() == WILDCARD {
@@ -124,7 +122,7 @@ impl Label {
         self.as_bytes() == WILDCARD
     }
 
-    /// Returns the lenght in bytes of this label
+    /// Returns the length in bytes of this label
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -245,11 +243,8 @@ impl Display for Label {
         if self.as_bytes().starts_with(IDNA_PREFIX) {
             // this should never be outside the ascii codes...
             let label = String::from_utf8_lossy(self.borrow());
-            let (label, e) = idna::Config::default()
-                .use_std3_ascii_rules(false)
-                .transitional_processing(false)
-                .verify_dns_length(false)
-                .to_unicode(&label);
+            let (label, e) =
+                Uts46::new().to_unicode(label.as_bytes(), AsciiDenyList::EMPTY, Hyphens::Allow);
 
             if e.is_ok() {
                 return f.write_str(&label);
@@ -296,6 +291,14 @@ impl Hash for Label {
     where
         H: Hasher,
     {
+        // Hash the length of the label by hashing a slice of ZSTs. Doing this ensures we use
+        // `Hasher::write_length_prefix()`, which has different domain separation behavior.
+        // Constructing a slice of ZSTs lets us use this method via existing standard library
+        // implementations, without needing to rely on nightly features. This does not allocate,
+        // since `()` is a ZST.
+        let vec = vec![(); self.len()];
+        vec.hash(state);
+        // Hash the label contents in canonical form.
         for b in self.borrow() as &[u8] {
             state.write_u8(b.to_ascii_lowercase());
         }
@@ -332,7 +335,7 @@ pub trait IntoLabel: Sized {
     fn into_label(self) -> ProtoResult<Label>;
 }
 
-impl<'a> IntoLabel for &'a Label {
+impl IntoLabel for &Label {
     fn into_label(self) -> ProtoResult<Label> {
         Ok(self.clone())
     }
@@ -344,7 +347,7 @@ impl IntoLabel for Label {
     }
 }
 
-impl<'a> IntoLabel for &'a str {
+impl IntoLabel for &str {
     fn into_label(self) -> ProtoResult<Label> {
         Label::from_utf8(self)
     }
@@ -356,7 +359,7 @@ impl IntoLabel for String {
     }
 }
 
-impl<'a> IntoLabel for &'a [u8] {
+impl IntoLabel for &[u8] {
     fn into_label(self) -> ProtoResult<Label> {
         Label::from_raw_bytes(self)
     }
@@ -371,6 +374,10 @@ impl IntoLabel for Vec<u8> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
+
+    use alloc::string::ToString;
+    #[cfg(feature = "std")]
+    use std::{eprintln, println};
 
     use super::*;
 
@@ -403,11 +410,12 @@ mod tests {
 
     fn assert_panic_label_too_long(error: ProtoResult<Label>, len: usize) {
         // poor man debug since ProtoResult don't implement Partial Eq due to ssl errors.
+        #[cfg(feature = "std")]
         eprintln!("{error:?}");
         assert!(error.is_err());
-        match *error.unwrap_err().kind() {
-            ProtoErrorKind::LabelBytesTooLong(n) if n == len => (),
-            ProtoErrorKind::LabelBytesTooLong(e) => {
+        match error.unwrap_err() {
+            ProtoError::Decode(DecodeError::LabelBytesTooLong(n)) if n == len => (),
+            ProtoError::Decode(DecodeError::LabelBytesTooLong(e)) => {
                 panic!(
                     "LabelTooLongError error don't report expected size {} of the label provided.",
                     e
@@ -436,7 +444,7 @@ mod tests {
     fn test_label_too_long_utf8_puny_emoji_mixed() {
         // too long mixed 65
         // Something international to say
-        // "Hello I like automn coffee 🦀 interresting"
+        // "Hello I like automn coffee 🦀 interesting"
         let emoji_case = "こんにちは-I-mögen-jesień-café-🦀-intéressant";
         let error = Label::from_utf8(emoji_case);
         assert_panic_label_too_long(error, 65);
@@ -553,6 +561,7 @@ mod tests {
         ];
 
         for (left, right) in comparisons {
+            #[cfg(feature = "std")]
             println!("left: {left}, right: {right}");
             assert_eq!(left.cmp(&right), Ordering::Less);
         }

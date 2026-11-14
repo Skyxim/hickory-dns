@@ -5,27 +5,27 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use std::future::{Future, ready};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use futures::stream::{once, Stream};
-use futures::{future, AsyncRead, AsyncWrite, Future};
+use futures::{
+    AsyncRead, AsyncWrite,
+    future::{self, BoxFuture},
+};
 
-use hickory_client::op::{Message, Query};
-use hickory_client::rr::rdata::{CNAME, SOA};
-use hickory_client::rr::{Name, RData, Record};
-use hickory_proto::error::ProtoError;
-use hickory_proto::tcp::DnsTcpStream;
-use hickory_proto::udp::DnsUdpSocket;
-#[cfg(any(feature = "dns-over-quic", feature = "dns-over-h3"))]
-use hickory_proto::udp::QuicLocalAddr;
-use hickory_proto::xfer::{DnsHandle, DnsRequest, DnsResponse};
-use hickory_proto::TokioTime;
-use hickory_resolver::config::{NameServerConfig, ResolverOpts};
-use hickory_resolver::name_server::{ConnectionProvider, RuntimeProvider};
-use hickory_resolver::TokioHandle;
+use hickory_net::NetError;
+use hickory_net::runtime::{DnsTcpStream, DnsUdpSocket, RuntimeProvider, TokioHandle, TokioTime};
+use hickory_net::xfer::DnsHandle;
+use hickory_proto::ProtoError;
+use hickory_proto::op::{DnsRequest, DnsResponse, Message, Query};
+use hickory_proto::rr::rdata::{CNAME, NS, SOA};
+use hickory_proto::rr::{Name, RData, Record};
+use hickory_resolver::config::ConnectionConfig;
+use hickory_resolver::{ConnectionProvider, PoolContext};
 
 pub struct TcpPlaceholder;
 
@@ -34,7 +34,7 @@ impl AsyncRead for TcpPlaceholder {
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
         buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
+    ) -> Poll<io::Result<usize>> {
         Poll::Ready(Ok(buf.len()))
     }
 }
@@ -44,15 +44,15 @@ impl AsyncWrite for TcpPlaceholder {
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    ) -> Poll<io::Result<usize>> {
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -63,16 +63,6 @@ impl DnsTcpStream for TcpPlaceholder {
 
 pub struct UdpPlaceholder;
 
-#[cfg(any(feature = "dns-over-quic", feature = "dns-over-h3"))]
-impl QuicLocalAddr for UdpPlaceholder {
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        Ok(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
-            9999,
-        ))
-    }
-}
-
 impl DnsUdpSocket for UdpPlaceholder {
     type Time = TokioTime;
 
@@ -80,7 +70,7 @@ impl DnsUdpSocket for UdpPlaceholder {
         &self,
         _cx: &mut Context<'_>,
         buf: &mut [u8],
-    ) -> Poll<std::io::Result<(usize, SocketAddr)>> {
+    ) -> Poll<io::Result<(usize, SocketAddr)>> {
         Poll::Ready(Ok((
             buf.len(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 77)), 1),
@@ -92,7 +82,7 @@ impl DnsUdpSocket for UdpPlaceholder {
         _cx: &mut Context<'_>,
         buf: &[u8],
         _target: SocketAddr,
-    ) -> Poll<std::io::Result<usize>> {
+    ) -> Poll<io::Result<usize>> {
         Poll::Ready(Ok(buf.len()))
     }
 }
@@ -100,7 +90,6 @@ impl DnsUdpSocket for UdpPlaceholder {
 #[derive(Clone, Default)]
 pub struct MockRuntimeProvider;
 
-#[allow(clippy::type_complexity)]
 impl RuntimeProvider for MockRuntimeProvider {
     type Handle = TokioHandle;
     type Timer = TokioTime;
@@ -114,7 +103,9 @@ impl RuntimeProvider for MockRuntimeProvider {
     fn connect_tcp(
         &self,
         _server_addr: SocketAddr,
-    ) -> Pin<Box<dyn Send + Future<Output = std::io::Result<Self::Tcp>>>> {
+        _bind_addr: Option<SocketAddr>,
+        _wait_for: Option<std::time::Duration>,
+    ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Tcp, io::Error>>>> {
         Box::pin(async { Ok(TcpPlaceholder) })
     }
 
@@ -122,7 +113,7 @@ impl RuntimeProvider for MockRuntimeProvider {
         &self,
         _local_addr: SocketAddr,
         _server_addr: SocketAddr,
-    ) -> Pin<Box<dyn Send + Future<Output = std::io::Result<Self::Udp>>>> {
+    ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Udp, io::Error>>>> {
         Box::pin(async { Ok(UdpPlaceholder) })
     }
 }
@@ -134,35 +125,40 @@ pub struct MockConnProvider<O: OnSend + Unpin> {
 
 impl<O: OnSend + Unpin> ConnectionProvider for MockConnProvider<O> {
     type Conn = MockClientHandle<O>;
-    type FutureConn = Pin<Box<dyn Send + Future<Output = Result<Self::Conn, ProtoError>>>>;
+    type FutureConn = Pin<Box<dyn Send + Future<Output = Result<Self::Conn, NetError>>>>;
     type RuntimeProvider = MockRuntimeProvider;
 
     fn new_connection(
         &self,
-        _config: &NameServerConfig,
-        _options: &ResolverOpts,
-    ) -> Self::FutureConn {
+        _: IpAddr,
+        _config: &ConnectionConfig,
+        _cx: &PoolContext,
+    ) -> Result<Self::FutureConn, NetError> {
         println!("MockConnProvider::new_connection");
-        Box::pin(future::ok(MockClientHandle::mock_on_send(
+        Ok(Box::pin(future::ok(MockClientHandle::mock_on_send(
             vec![],
             self.on_send.clone(),
-        )))
+        ))))
+    }
+
+    fn runtime_provider(&self) -> &Self::RuntimeProvider {
+        &MockRuntimeProvider
     }
 }
 
 #[derive(Clone)]
 pub struct MockClientHandle<O: OnSend> {
-    messages: Arc<Mutex<Vec<Result<DnsResponse, ProtoError>>>>,
+    messages: Arc<Mutex<Vec<Result<DnsResponse, NetError>>>>,
     on_send: O,
 }
 
 impl MockClientHandle<DefaultOnSend> {
     /// constructs a new MockClient which returns each Message one after the other (messages are
     /// popped off the back of `messages`, so they are sent in reverse order).
-    pub fn mock(messages: Vec<Result<DnsResponse, ProtoError>>) -> Self {
+    pub fn mock(messages: Vec<Result<DnsResponse, NetError>>) -> Self {
         println!("MockClientHandle::mock message count: {}", messages.len());
 
-        MockClientHandle {
+        Self {
             messages: Arc::new(Mutex::new(messages)),
             on_send: DefaultOnSend,
         }
@@ -172,13 +168,13 @@ impl MockClientHandle<DefaultOnSend> {
 impl<O: OnSend> MockClientHandle<O> {
     /// constructs a new MockClient which returns each Message one after the other (messages are
     /// popped off the back of `messages`, so they are sent in reverse order).
-    pub fn mock_on_send(messages: Vec<Result<DnsResponse, ProtoError>>, on_send: O) -> Self {
+    pub fn mock_on_send(messages: Vec<Result<DnsResponse, NetError>>, on_send: O) -> Self {
         println!(
             "MockClientHandle::mock_on_send message count: {}",
             messages.len()
         );
 
-        MockClientHandle {
+        Self {
             messages: Arc::new(Mutex::new(messages)),
             on_send,
         }
@@ -186,16 +182,22 @@ impl<O: OnSend> MockClientHandle<O> {
 }
 
 impl<O: OnSend + Unpin> DnsHandle for MockClientHandle<O> {
-    type Response = Pin<Box<dyn Stream<Item = Result<DnsResponse, ProtoError>> + Send>>;
+    type Runtime = MockRuntimeProvider;
 
-    fn send<R: Into<DnsRequest>>(&self, _: R) -> Self::Response {
+    fn send(&self, _: DnsRequest) -> impl Future<Output = Result<DnsResponse, NetError>> + Send {
         let mut messages = self.messages.lock().expect("failed to lock at messages");
         println!("MockClientHandle::send message count: {}", messages.len());
 
-        Box::pin(once(self.on_send.on_send(messages.pop().unwrap_or_else(
-            || error(ProtoError::from("Messages exhausted in MockClientHandle")),
-        ))))
+        self.on_send.on_send(
+            messages
+                .pop()
+                .unwrap_or_else(|| Err(NetError::from("Messages exhausted in MockClientHandle"))),
+        )
     }
+}
+
+pub fn ns_record(name: Name, nsname: Name) -> Record {
+    Record::from_rdata(name, 86400, RData::NS(NS(nsname)))
 }
 
 pub fn cname_record(name: Name, cname: Name) -> Record {
@@ -207,41 +209,43 @@ pub fn v4_record(name: Name, ip: Ipv4Addr) -> Record {
 }
 
 pub fn soa_record(name: Name, mname: Name) -> Record {
-    let soa = SOA::new(mname, Default::default(), 1, 3600, 60, 86400, 3600);
+    let soa = SOA::new(mname, Name::default(), 1, 3600, 60, 86400, 3600);
     Record::from_rdata(name, 86400, RData::SOA(soa))
+}
+
+pub fn build_request(query: Query) -> DnsRequest {
+    let mut message = Message::query();
+    message.add_query(query);
+    DnsRequest::from(message)
 }
 
 pub fn message(
     query: Query,
     answers: Vec<Record>,
-    name_servers: Vec<Record>,
+    authorities: Vec<Record>,
     additionals: Vec<Record>,
 ) -> Message {
-    let mut message = Message::new();
+    let mut message = Message::query();
     message.add_query(query);
     message.insert_answers(answers);
-    message.insert_name_servers(name_servers);
+    message.insert_authorities(authorities);
     message.insert_additionals(additionals);
-    message
+    message.into_response()
 }
 
 pub fn empty() -> Result<DnsResponse, ProtoError> {
-    Ok(DnsResponse::from_message(Message::new()).unwrap())
-}
-
-pub fn error<E>(error: E) -> Result<DnsResponse, E> {
-    Err(error)
+    Ok(DnsResponse::from_message(Message::query().into_response()).unwrap())
 }
 
 pub trait OnSend: Clone + Send + Sync + 'static {
     fn on_send<E>(
         &self,
         response: Result<DnsResponse, E>,
-    ) -> Pin<Box<dyn Future<Output = Result<DnsResponse, E>> + Send>>
+    ) -> BoxFuture<'static, Result<DnsResponse, E>>
     where
-        E: From<ProtoError> + Send + 'static,
+        E: From<NetError> + Send + 'static,
     {
-        Box::pin(future::ready(response))
+        Box::pin(ready(response))
     }
 }
 

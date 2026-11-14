@@ -13,149 +13,67 @@
 //! ```text
 //! The Certification Authority Authorization (CAA) DNS Resource Record
 //! allows a DNS domain name holder to specify one or more Certification
-//! Authorities (CAs) authorized to issue certificates for that domain.
-//! CAA Resource Records allow a public Certification Authority to
-//! implement additional controls to reduce the risk of unintended
-//! certificate mis-issue.  This document defines the syntax of the CAA
-//! record and rules for processing CAA records by certificate issuers.
+//! Authorities (CAs) authorized to issue certificates for that domain
+//! name.  CAA Resource Records allow a public CA to implement additional
+//! controls to reduce the risk of unintended certificate mis-issue.
+//! This document defines the syntax of the CAA record and rules for
+//! processing CAA records by CAs.
 //! ```
 #![allow(clippy::use_self)]
 
-use std::{fmt, str};
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use core::{
+    fmt,
+    net::Ipv6Addr,
+    str::{self, FromStr},
+};
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use url::Url;
+use tracing::warn;
 
 use crate::{
-    error::{ProtoError, ProtoResult},
-    rr::{domain::Name, RData, RecordData, RecordDataDecodable, RecordType},
-    serialize::binary::*,
+    error::ProtoResult,
+    rr::{RData, RecordData, RecordDataDecodable, RecordType, domain::Name},
+    serialize::{binary::*, txt::ParseError},
 };
 
 /// The CAA RR Type
 ///
 /// [RFC 8659, DNS Certification Authority Authorization, November 2019](https://www.rfc-editor.org/rfc/rfc8659)
-///
-/// ```text
-/// 3.  The CAA RR Type
-///
-/// A CAA RR consists of a flags byte and a tag-value pair referred to as
-/// a property.  Multiple properties MAY be associated with the same
-/// domain name by publishing multiple CAA RRs at that domain name.  The
-/// following flag is defined:
-///
-/// Issuer Critical:  If set to '1', indicates that the corresponding
-///    property tag MUST be understood if the semantics of the CAA record
-///    are to be correctly interpreted by an issuer.
-///
-///    Issuers MUST NOT issue certificates for a domain if the relevant
-///    CAA Resource Record set contains unknown property tags that have
-///    the Critical bit set.
-///
-/// The following property tags are defined:
-///
-/// issue <Issuer Domain Name> [; <name>=<value> ]* :  The issue property
-///    entry authorizes the holder of the domain name <Issuer Domain
-///    Name> or a party acting under the explicit authority of the holder
-///    of that domain name to issue certificates for the domain in which
-///    the property is published.
-///
-/// issuewild <Issuer Domain Name> [; <name>=<value> ]* :  The issuewild
-///    property entry authorizes the holder of the domain name <Issuer
-///    Domain Name> or a party acting under the explicit authority of the
-///    holder of that domain name to issue wildcard certificates for the
-///    domain in which the property is published.
-///
-/// iodef <URL> :  Specifies a URL to which an issuer MAY report
-///    certificate issue requests that are inconsistent with the issuer's
-///    Certification Practices or Certificate Policy, or that a
-///    Certificate Evaluator may use to report observation of a possible
-///    policy violation.  The Incident Object Description Exchange Format
-///    (IODEF) format is used [RFC5070].
-///
-/// The following example is a DNS zone file (see [RFC1035]) that informs
-/// CAs that certificates are not to be issued except by the holder of
-/// the domain name 'ca.example.net' or an authorized agent thereof.
-/// This policy applies to all subordinate domains under example.com.
-///
-/// $ORIGIN example.com
-/// .       CAA 0 issue "ca.example.net"
-///
-/// If the domain name holder specifies one or more iodef properties, a
-/// certificate issuer MAY report invalid certificate requests to that
-/// address.  In the following example, the domain name holder specifies
-/// that reports may be made by means of email with the IODEF data as an
-/// attachment, a Web service [RFC6546], or both:
-///
-/// $ORIGIN example.com
-/// .       CAA 0 issue "ca.example.net"
-/// .       CAA 0 iodef "mailto:security@example.com"
-/// .       CAA 0 iodef "https://iodef.example.com/"
-///
-/// A certificate issuer MAY specify additional parameters that allow
-/// customers to specify additional parameters governing certificate
-/// issuance.  This might be the Certificate Policy under which the
-/// certificate is to be issued, the authentication process to be used
-/// might be specified, or an account number specified by the CA to
-/// enable these parameters to be retrieved.
-///
-/// For example, the CA 'ca.example.net' has requested its customer
-/// 'example.com' to specify the CA's account number '230123' in each of
-/// the customer's CAA records.
-///
-/// $ORIGIN example.com
-/// .       CAA 0 issue "ca.example.net; account=230123"
-///
-/// The syntax of additional parameters is a sequence of name-value pairs
-/// as defined in Section 5.2.  The semantics of such parameters is left
-/// to site policy and is outside the scope of this document.
-///
-/// The critical flag is intended to permit future versions CAA to
-/// introduce new semantics that MUST be understood for correct
-/// processing of the record, preventing conforming CAs that do not
-/// recognize the new semantics from issuing certificates for the
-/// indicated domains.
-///
-/// In the following example, the property 'tbs' is flagged as critical.
-/// Neither the example.net CA nor any other issuer is authorized to
-/// issue under either policy unless the processing rules for the 'tbs'
-/// property tag are understood.
-///
-/// $ORIGIN example.com
-/// .       CAA 0 issue "ca.example.net; policy=ev"
-/// .       CAA 128 tbs "Unknown"
-///
-/// Note that the above restrictions only apply at certificate issue.
-/// Since the validity of an end entity certificate is typically a year
-/// or more, it is quite possible that the CAA records published at a
-/// domain will change between the time a certificate was issued and
-/// validation by a relying party.
-/// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct CAA {
-    #[doc(hidden)]
+    /// Indicates that the corresponding property tag MUST be understood if the semantics
+    /// of the CAA record are to be correctly interpreted by an issuer
     pub issuer_critical: bool,
-    #[doc(hidden)]
-    pub tag: Property,
-    #[doc(hidden)]
-    pub value: Value,
+
+    /// The flags of the record minus the issuer_critical flag
+    pub reserved_flags: u8,
+
+    /// The property tag
+    pub tag: String,
+
+    /// The raw value of the CAA record
+    pub value: Vec<u8>,
 }
 
 impl CAA {
     fn issue(
         issuer_critical: bool,
-        tag: Property,
+        tag: IssueProperty,
         name: Option<Name>,
         options: Vec<KeyValue>,
     ) -> Self {
-        assert!(tag.is_issue() || tag.is_issuewild());
+        let tag = tag.as_str().to_owned();
+        let value = encode_issuer_value(name.as_ref(), &options);
 
         Self {
             issuer_critical,
+            reserved_flags: 0,
             tag,
-            value: Value::Issuer(name, options),
+            value,
         }
     }
 
@@ -167,7 +85,7 @@ impl CAA {
     /// * `name` - authorized to issue certificates for the associated record label
     /// * `options` - additional options for the issuer, e.g. 'account', etc.
     pub fn new_issue(issuer_critical: bool, name: Option<Name>, options: Vec<KeyValue>) -> Self {
-        Self::issue(issuer_critical, Property::Issue, name, options)
+        Self::issue(issuer_critical, IssueProperty::Issue, name, options)
     }
 
     /// Creates a new CAA issue record data, the tag is `issuewild`
@@ -182,7 +100,7 @@ impl CAA {
         name: Option<Name>,
         options: Vec<KeyValue>,
     ) -> Self {
-        Self::issue(issuer_critical, Property::IssueWild, name, options)
+        Self::issue(issuer_critical, IssueProperty::IssueWild, name, options)
     }
 
     /// Creates a new CAA issue record data, the tag is `iodef`
@@ -190,199 +108,167 @@ impl CAA {
     /// # Arguments
     ///
     /// * `issuer_critical` - indicates that the corresponding property tag MUST be understood if the semantics of the CAA record are to be correctly interpreted by an issuer
-    /// * `url` - Url where issuer errors should be reported
-    ///
-    /// # Panics
-    ///
-    /// If `value` is not `Value::Issuer`
-    pub fn new_iodef(issuer_critical: bool, url: Url) -> Self {
+    /// * `url` - URL where issuer errors should be reported
+    pub fn new_iodef(issuer_critical: bool, url: &str) -> Self {
+        let value = url.as_bytes().to_vec();
         Self {
             issuer_critical,
-            tag: Property::Iodef,
-            value: Value::Url(url),
+            reserved_flags: 0,
+            tag: "iodef".to_owned(),
+            value,
         }
     }
 
-    /// Indicates that the corresponding property tag MUST be understood if the semantics of the CAA record are to be correctly interpreted by an issuer
-    pub fn issuer_critical(&self) -> bool {
-        self.issuer_critical
+    /// Parse the RData from a set of Tokens
+    ///
+    /// [RFC 6844, DNS Certification Authority Authorization, January 2013](https://tools.ietf.org/html/rfc6844#section-5.1)
+    ///
+    /// ```text
+    /// 5.1.1.  Canonical Presentation Format
+    ///
+    ///    The canonical presentation format of the CAA record is:
+    ///
+    ///    CAA <flags> <tag> <value>
+    ///
+    ///    Where:
+    ///
+    ///    Flags:  Is an unsigned integer between 0 and 255.
+    ///
+    ///    Tag:  Is a non-zero sequence of US-ASCII letters and numbers in lower
+    ///       case.
+    ///
+    ///    Value:  Is the <character-string> encoding of the value field as
+    ///       specified in [RFC1035], Section 5.1.
+    /// ```
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        mut tokens: I,
+    ) -> Result<CAA, ParseError> {
+        let flags_str: &str = tokens
+            .next()
+            .ok_or_else(|| ParseError::from("caa flags not present"))?;
+        let tag_str: &str = tokens
+            .next()
+            .ok_or_else(|| ParseError::from("caa tag not present"))?;
+        let value_str: &str = tokens
+            .next()
+            .ok_or_else(|| ParseError::from("caa value not present"))?;
+
+        // parse the flags
+        let flags = flags_str.parse::<u8>()?;
+        let issuer_critical = (flags & 0b1000_0000) != 0;
+        let reserved_flags = flags & 0b0111_1111;
+        if reserved_flags != 0 {
+            warn!("unexpected flag values in caa (0 or 128): {}", flags);
+        }
+
+        let tag = tag_str.to_owned();
+        let value = value_str.as_bytes().to_vec();
+
+        // return the new CAA record
+        Ok(CAA {
+            issuer_critical,
+            reserved_flags,
+            tag,
+            value,
+        })
     }
 
-    /// The property tag, see struct documentation
-    pub fn tag(&self) -> &Property {
-        &self.tag
+    /// Returns the Flags field of the resource record
+    pub fn flags(&self) -> u8 {
+        let mut flags = self.reserved_flags & 0b0111_1111;
+        if self.issuer_critical {
+            flags |= 0b1000_0000;
+        }
+        flags
     }
 
-    /// a potentially associated value with the property tag, see struct documentation
-    pub fn value(&self) -> &Value {
-        &self.value
+    /// Set the value associated with an `issue` or `issuewild` tag.
+    ///
+    /// This returns an error if the tag is not `issue` or `issuewild`.
+    pub fn set_issuer_value(
+        &mut self,
+        name: Option<&Name>,
+        key_values: &[KeyValue],
+    ) -> ProtoResult<()> {
+        if !self.tag.eq_ignore_ascii_case("issue") && !self.tag.eq_ignore_ascii_case("issuewild") {
+            return Err("CAA property tag is not 'issue' or 'issuewild'".into());
+        }
+        self.value = encode_issuer_value(name, key_values);
+        Ok(())
+    }
+
+    /// Set the value associated with an `iodef` tag.
+    ///
+    /// This returns an error if the tag is not `iodef`.
+    pub fn set_iodef_value(&mut self, url: &str) -> ProtoResult<()> {
+        if !self.tag.eq_ignore_ascii_case("iodef") {
+            return Err("CAA property tag is not 'iodef'".into());
+        }
+        self.value = url.as_bytes().to_vec();
+        Ok(())
+    }
+
+    /// Get the value of an `issue` or `issuewild` CAA record.
+    ///
+    /// This returns an error if the record's tag is not `issue` or `issuewild`, or if the value
+    /// does not match the expected syntax.
+    pub fn value_as_issue(&self) -> ProtoResult<(Option<Name>, Vec<KeyValue>)> {
+        if !self.tag.eq_ignore_ascii_case("issue") && !self.tag.eq_ignore_ascii_case("issuewild") {
+            return Err("CAA property tag is not 'issue' or 'issuewild'".into());
+        }
+        read_issuer(&self.value)
+    }
+
+    /// Get the value of an `iodef` CAA record.
+    ///
+    /// This returns an error if the record's tag is not `iodef`, or if the value is not a valid
+    /// `mailto`, `http` or `https` URL. See [`read_iodef`] for details.
+    pub fn value_as_iodef(&self) -> ProtoResult<String> {
+        if !self.tag.eq_ignore_ascii_case("iodef") {
+            return Err("CAA property tag is not 'iodef'".into());
+        }
+        read_iodef(&self.value)
     }
 }
 
-/// Specifies in what contexts this key may be trusted for use
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum Property {
-    /// The issue property
-    ///    entry authorizes the holder of the domain name `Issuer Domain
-    ///    Name`` or a party acting under the explicit authority of the holder
-    ///    of that domain name to issue certificates for the domain in which
-    ///    the property is published.
+enum IssueProperty {
     Issue,
-    /// The issuewild
-    ///    property entry authorizes the holder of the domain name `Issuer
-    ///    Domain Name` or a party acting under the explicit authority of the
-    ///    holder of that domain name to issue wildcard certificates for the
-    ///    domain in which the property is published.
     IssueWild,
-    /// Specifies a URL to which an issuer MAY report
-    ///    certificate issue requests that are inconsistent with the issuer's
-    ///    Certification Practices or Certificate Policy, or that a
-    ///    Certificate Evaluator may use to report observation of a possible
-    ///    policy violation. The Incident Object Description Exchange Format
-    ///    (IODEF) format is used [RFC7970](https://www.rfc-editor.org/rfc/rfc7970).
-    Iodef,
-    /// Unknown format to Hickory DNS
-    Unknown(String),
 }
 
-impl Property {
-    /// Convert to string form
-    pub fn as_str(&self) -> &str {
-        match *self {
+impl IssueProperty {
+    fn as_str(&self) -> &str {
+        match self {
             Self::Issue => "issue",
             Self::IssueWild => "issuewild",
-            Self::Iodef => "iodef",
-            Self::Unknown(ref property) => property,
         }
-    }
-
-    /// true if the property is `issue`
-    pub fn is_issue(&self) -> bool {
-        matches!(*self, Self::Issue)
-    }
-
-    /// true if the property is `issueworld`
-    pub fn is_issuewild(&self) -> bool {
-        matches!(*self, Self::IssueWild)
-    }
-
-    /// true if the property is `iodef`
-    pub fn is_iodef(&self) -> bool {
-        matches!(*self, Self::Iodef)
-    }
-
-    /// true if the property is not known to Hickory DNS
-    pub fn is_unknown(&self) -> bool {
-        matches!(*self, Self::Unknown(_))
     }
 }
 
-impl From<String> for Property {
-    fn from(tag: String) -> Self {
-        // [RFC 8659 section 4.1-11](https://www.rfc-editor.org/rfc/rfc8659#section-4.1-11)
-        // states that "Matching of tag values is case insensitive."
-        let lower = tag.to_ascii_lowercase();
-        match &lower as &str {
-            "issue" => return Self::Issue,
-            "issuewild" => return Self::IssueWild,
-            "iodef" => return Self::Iodef,
-            &_ => (),
-        }
+fn encode_issuer_value(name: Option<&Name>, key_values: &[KeyValue]) -> Vec<u8> {
+    let mut output = Vec::new();
 
-        Self::Unknown(tag)
-    }
-}
-
-/// Potential values.
-///
-/// These are based off the Tag field:
-///
-/// `Issue` and `IssueWild` => `Issuer`,
-/// `Iodef` => `Url`,
-/// `Unknown` => `Unknown`,
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum Value {
-    /// Issuer authorized to issue certs for this zone, and any associated parameters
-    Issuer(Option<Name>, Vec<KeyValue>),
-    /// Url to which to send CA errors
-    Url(Url),
-    /// Unrecognized tag and value by Hickory DNS
-    Unknown(Vec<u8>),
-}
-
-impl Value {
-    /// true if this is an `Issuer`
-    pub fn is_issuer(&self) -> bool {
-        matches!(*self, Value::Issuer(..))
+    // output the name
+    if let Some(name) = name {
+        let name = name.to_ascii();
+        output.extend_from_slice(name.as_bytes());
     }
 
-    /// true if this is a `Url`
-    pub fn is_url(&self) -> bool {
-        matches!(*self, Value::Url(..))
+    // if there was no name, then we just output ';'
+    if name.is_none() && key_values.is_empty() {
+        output.push(b';');
+        return output;
     }
 
-    /// true if this is an `Unknown`
-    pub fn is_unknown(&self) -> bool {
-        matches!(*self, Value::Unknown(..))
+    for key_value in key_values {
+        output.push(b';');
+        output.push(b' ');
+        output.extend_from_slice(key_value.key.as_bytes());
+        output.push(b'=');
+        output.extend_from_slice(key_value.value.as_bytes());
     }
-}
 
-fn read_value(
-    tag: &Property,
-    decoder: &mut BinDecoder<'_>,
-    value_len: Restrict<u16>,
-) -> ProtoResult<Value> {
-    let value_len = value_len.map(|u| u as usize).unverified(/*used purely as length safely*/);
-    match *tag {
-        Property::Issue | Property::IssueWild => {
-            let slice = decoder.read_slice(value_len)?.unverified(/*read_issuer verified as safe*/);
-            let value = read_issuer(slice)?;
-            Ok(Value::Issuer(value.0, value.1))
-        }
-        Property::Iodef => {
-            let url = decoder.read_slice(value_len)?.unverified(/*read_iodef verified as safe*/);
-            let url = read_iodef(url)?;
-            Ok(Value::Url(url))
-        }
-        Property::Unknown(_) => Ok(Value::Unknown(
-            decoder.read_vec(value_len)?.unverified(/*unknown will fail in usage*/),
-        )),
-    }
-}
-
-fn emit_value(encoder: &mut BinEncoder<'_>, value: &Value) -> ProtoResult<()> {
-    match *value {
-        Value::Issuer(ref name, ref key_values) => {
-            // output the name
-            if let Some(ref name) = *name {
-                let name = name.to_string();
-                encoder.emit_vec(name.as_bytes())?;
-            }
-
-            // if there was no name, then we just output ';'
-            if name.is_none() && key_values.is_empty() {
-                return encoder.emit(b';');
-            }
-
-            for key_value in key_values {
-                encoder.emit(b';')?;
-                encoder.emit(b' ')?;
-                encoder.emit_vec(key_value.key.as_bytes())?;
-                encoder.emit(b'=')?;
-                encoder.emit_vec(key_value.value.as_bytes())?;
-            }
-
-            Ok(())
-        }
-        Value::Url(ref url) => {
-            let url = url.as_str();
-            let bytes = url.as_bytes();
-            encoder.emit_vec(bytes)
-        }
-        Value::Unknown(ref data) => encoder.emit_vec(data),
-    }
+    output
 }
 
 enum ParseNameKeyPairState {
@@ -401,80 +287,89 @@ enum ParseNameKeyPairState {
 
 /// Reads the issuer field according to the spec
 ///
-/// [RFC 8659, DNS Certification Authority Authorization, November 2019](https://www.rfc-editor.org/rfc/rfc8659)
+/// [RFC 8659, DNS Certification Authority Authorization, November 2019](https://www.rfc-editor.org/rfc/rfc8659),
+/// and [errata 7139](https://www.rfc-editor.org/errata/eid7139)
 ///
 /// ```text
-/// 5.2.  CAA issue Property
+/// 4.2.  CAA issue Property
 ///
-///    The issue property tag is used to request that certificate issuers
-///    perform CAA issue restriction processing for the domain and to grant
-///    authorization to specific certificate issuers.
+///    If the issue Property Tag is present in the Relevant RRset for an
+///    FQDN, it is a request that Issuers:
 ///
-///    The CAA issue property value has the following sub-syntax (specified
+///    1.  Perform CAA issue restriction processing for the FQDN, and
+///
+///    2.  Grant authorization to issue certificates containing that FQDN to
+///        the holder of the issuer-domain-name or a party acting under the
+///        explicit authority of the holder of the issuer-domain-name.
+///
+///    The CAA issue Property Value has the following sub-syntax (specified
 ///    in ABNF as per [RFC5234]).
 ///
-///    issuevalue  = space [domain] space [";" *(space parameter) space]
+///    issue-value = *WSP [issuer-domain-name *WSP]
+///       [";" *WSP [parameters *WSP]]
 ///
-///    domain = label *("." label)
+///    issuer-domain-name = label *("." label)
 ///    label = (ALPHA / DIGIT) *( *("-") (ALPHA / DIGIT))
 ///
-///    space = *(SP / HTAB)
+///    parameters = (parameter *WSP ";" *WSP parameters) / parameter
+///    parameter = parameter-tag *WSP "=" *WSP parameter-value
+///    parameter-tag = (ALPHA / DIGIT) *( *("-") (ALPHA / DIGIT))
+///    parameter-value = *(%x21-3A / %x3C-7E)
 ///
-///    parameter =  tag "=" value
+///    For consistency with other aspects of DNS administration, FQDN values
+///    are specified in letter-digit-hyphen Label (LDH-Label) form.
 ///
-///    tag = 1*(ALPHA / DIGIT)
+///    The following CAA RRset requests that no certificates be issued for
+///    the FQDN "certs.example.com" by any Issuer other than ca1.example.net
+///    or ca2.example.org.
 ///
-///    value = *VCHAR
+///    certs.example.com         CAA 0 issue "ca1.example.net"
+///    certs.example.com         CAA 0 issue "ca2.example.org"
 ///
-///    For consistency with other aspects of DNS administration, domain name
-///    values are specified in letter-digit-hyphen Label (LDH-Label) form.
+///    Because the presence of an issue Property Tag in the Relevant RRset
+///    for an FQDN restricts issuance, FQDN owners can use an issue Property
+///    Tag with no issuer-domain-name to request no issuance.
 ///
-///    A CAA record with an issue parameter tag that does not specify a
-///    domain name is a request that certificate issuers perform CAA issue
-///    restriction processing for the corresponding domain without granting
-///    authorization to any certificate issuer.
-///
-///    This form of issue restriction would be appropriate to specify that
-///    no certificates are to be issued for the domain in question.
-///
-///    For example, the following CAA record set requests that no
-///    certificates be issued for the domain 'nocerts.example.com' by any
-///    certificate issuer.
+///    For example, the following RRset requests that no certificates be
+///    issued for the FQDN "nocerts.example.com" by any Issuer.
 ///
 ///    nocerts.example.com       CAA 0 issue ";"
 ///
-///    A CAA record with an issue parameter tag that specifies a domain name
-///    is a request that certificate issuers perform CAA issue restriction
-///    processing for the corresponding domain and grants authorization to
-///    the certificate issuer specified by the domain name.
+///    An issue Property Tag where the issue-value does not match the ABNF
+///    grammar MUST be treated the same as one specifying an empty
+///    issuer-domain-name.  For example, the following malformed CAA RRset
+///    forbids issuance:
 ///
-///    For example, the following CAA record set requests that no
-///    certificates be issued for the domain 'certs.example.com' by any
-///    certificate issuer other than the example.net certificate issuer.
-///
-///    certs.example.com       CAA 0 issue "example.net"
+///    malformed.example.com     CAA 0 issue "%%%%%"
 ///
 ///    CAA authorizations are additive; thus, the result of specifying both
-///    the empty issuer and a specified issuer is the same as specifying
-///    just the specified issuer alone.
+///    an empty issuer-domain-name and a non-empty issuer-domain-name is the
+///    same as specifying just the non-empty issuer-domain-name.
 ///
-///    An issuer MAY choose to specify issuer-parameters that further
-///    constrain the issue of certificates by that issuer, for example,
-///    specifying that certificates are to be subject to specific validation
-///    polices, billed to certain accounts, or issued under specific trust
-///    anchors.
+///    An Issuer MAY choose to specify parameters that further constrain the
+///    issue of certificates by that Issuer -- for example, specifying that
+///    certificates are to be subject to specific validation policies,
+///    billed to certain accounts, or issued under specific trust anchors.
 ///
-///    The semantics of issuer-parameters are determined by the issuer
-///    alone.
+///    For example, if ca1.example.net has requested that its customer
+///    account.example.com specify their account number "230123" in each of
+///    the customer's CAA records using the (CA-defined) "account"
+///    parameter, it would look like this:
+///
+///    account.example.com   CAA 0 issue "ca1.example.net; account=230123"
+///
+///    The semantics of parameters to the issue Property Tag are determined
+///    by the Issuer alone.
 /// ```
 ///
 /// Updated parsing rules:
 ///
 /// [RFC8659 Canonical presentation form and ABNF](https://www.rfc-editor.org/rfc/rfc8659#name-canonical-presentation-form)
 ///
-/// This explicitly allows `-` in key names, diverging from the original RFC. To support this, key names will
-/// allow `-` as non-starting characters. Additionally, this significantly relaxes the characters allowed in the value
-/// to allow URL like characters (it does not validate URL syntax).
+/// This explicitly allows `-` in property tags, diverging from the original RFC. To support this,
+/// property tags will allow `-` as non-starting characters. Additionally, this significantly
+/// relaxes the characters allowed in the value to allow URL like characters (it does not validate
+/// URL syntax).
 pub fn read_issuer(bytes: &[u8]) -> ProtoResult<(Option<Name>, Vec<KeyValue>)> {
     let mut byte_iter = bytes.iter();
 
@@ -485,7 +380,7 @@ pub fn read_issuer(bytes: &[u8]) -> ProtoResult<(Option<Name>, Vec<KeyValue>)> {
 
         if !name_str.is_empty() {
             let name_str = str::from_utf8(&name_str)?;
-            Some(Name::parse(name_str, None)?)
+            Some(Name::from_ascii(name_str)?)
         } else {
             None
         }
@@ -494,7 +389,7 @@ pub fn read_issuer(bytes: &[u8]) -> ProtoResult<(Option<Name>, Vec<KeyValue>)> {
     // initial state is looking for a key ';' is valid...
     let mut state = ParseNameKeyPairState::BeforeKey(vec![]);
 
-    // run the state machine through all remaining data, collecting all key/value pairs.
+    // run the state machine through all remaining data, collecting all parameter tag/value pairs.
     for ch in byte_iter {
         match state {
             // Name was already successfully parsed, otherwise we couldn't get here.
@@ -557,8 +452,10 @@ pub fn read_issuer(bytes: &[u8]) -> ProtoResult<(Option<Name>, Vec<KeyValue>)> {
                         key_values.push(KeyValue { key, value });
                         state = ParseNameKeyPairState::BeforeKey(key_values);
                     }
-                    // push onto the existing key
-                    ch if !ch.is_control() && !ch.is_whitespace() => {
+                    // If the next byte is a visible character, excluding ';', push it onto the
+                    // existing value. See the ABNF production rule for `parameter-value` in the
+                    // documentation above.
+                    ch if ('\x21'..='\x3A').contains(&ch) || ('\x3C'..='\x7E').contains(&ch) => {
                         value.push(ch);
 
                         state = ParseNameKeyPairState::Value {
@@ -598,39 +495,127 @@ pub fn read_issuer(bytes: &[u8]) -> ProtoResult<(Option<Name>, Vec<KeyValue>)> {
 /// [RFC 8659, DNS Certification Authority Authorization, November 2019](https://www.rfc-editor.org/rfc/rfc8659#section-4.4)
 ///
 /// ```text
-/// 5.4.  CAA iodef Property
+/// 4.4.  CAA iodef Property
 ///
-///    The iodef property specifies a means of reporting certificate issue
-///    requests or cases of certificate issue for the corresponding domain
-///    that violate the security policy of the issuer or the domain name
+///    The iodef Property specifies a means of reporting certificate issue
+///    requests or cases of certificate issue for domains for which the
+///    Property appears in the Relevant RRset, when those requests or
+///    issuances violate the security policy of the Issuer or the FQDN
 ///    holder.
 ///
-///    The Incident Object Description Exchange Format (IODEF) [RFC7970](https://www.rfc-editor.org/info/rfc7970) is
+///    The Incident Object Description Exchange Format (IODEF) [RFC7970] is
 ///    used to present the incident report in machine-readable form.
 ///
-///    The iodef property takes a URL as its parameter.  The URL scheme type
-///    determines the method used for reporting:
+///    The iodef Property Tag takes a URL as its Property Value.  The URL
+///    scheme type determines the method used for reporting:
 ///
-///    mailto:  The IODEF incident report is reported as a MIME email
-///       attachment to an SMTP email that is submitted to the mail address
-///       specified.  The mail message sent SHOULD contain a brief text
-///       message to alert the recipient to the nature of the attachment.
+///    mailto:  The IODEF report is reported as a MIME email attachment to
+///       an SMTP email that is submitted to the mail address specified.
+///       The mail message sent SHOULD contain a brief text message to alert
+///       the recipient to the nature of the attachment.
 ///
-///    http or https:  The IODEF report is submitted as a Web service
+///    http or https:  The IODEF report is submitted as a web service
 ///       request to the HTTP address specified using the protocol specified
 ///       in [RFC6546].
+///
+///    These are the only supported URL schemes.
+///
+///    The following RRset specifies that reports may be made by means of
+///    email with the IODEF data as an attachment, a web service [RFC6546],
+///    or both:
+///
+///    report.example.com         CAA 0 issue "ca1.example.net"
+///    report.example.com         CAA 0 iodef "mailto:security@example.com"
+///    report.example.com         CAA 0 iodef "https://iodef.example.com/"
 /// ```
-pub fn read_iodef(url: &[u8]) -> ProtoResult<Url> {
+pub fn read_iodef(url: &[u8]) -> ProtoResult<String> {
     let url = str::from_utf8(url)?;
-    let url = Url::parse(url)?;
-    Ok(url)
+    if !url
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || URL_CHARS.contains(&c))
+    {
+        return Err(format!("CAA iodef URL contains disallowed characters: {url}").into());
+    }
+
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return Err("CAA iodef URL is missing a scheme".into());
+    };
+
+    if scheme.eq_ignore_ascii_case("mailto") {
+        for address in rest.split(',') {
+            let Some((local, domain)) = address.rsplit_once('@') else {
+                return Err(format!("invalid address in CAA iodef mailto URL: {address}").into());
+            };
+            if local.is_empty() || domain.is_empty() {
+                return Err(format!("invalid address in CAA iodef mailto URL: {address}").into());
+            }
+        }
+    } else if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+        let Some(rest) = rest.strip_prefix("//") else {
+            return Err(format!("CAA iodef HTTP URL is missing authority: {rest}").into());
+        };
+
+        let authority = match rest.split_once(['/', '?', '#']) {
+            Some((authority, _)) => authority,
+            None => rest,
+        };
+
+        let host_port = match authority.rsplit_once('@') {
+            Some((_, host_port)) => host_port,
+            None => authority,
+        };
+
+        let (host, port) = match host_port.strip_prefix('[') {
+            Some(literal) => {
+                let Some((address, port)) = literal.split_once(']') else {
+                    return Err("unterminated IPv6 literal in CAA iodef URL".into());
+                };
+                if Ipv6Addr::from_str(address).is_err() {
+                    return Err(format!("invalid IPv6 literal in CAA iodef URL: {address}").into());
+                }
+                match port.strip_prefix(':') {
+                    Some(port) => (address, port),
+                    None => return Err(format!("invalid port in CAA iodef URL: {port}").into()),
+                }
+            }
+            None => {
+                if host_port.contains(['[', ']']) {
+                    return Err(format!("invalid host in CAA iodef URL: {host_port}").into());
+                }
+                match host_port.split_once(':') {
+                    Some((host, port)) => (host, port),
+                    None => (host_port, ""),
+                }
+            }
+        };
+
+        if host.is_empty() {
+            return Err(format!("CAA iodef HTTP URL is missing a host: {url}").into());
+        }
+
+        if !port.is_empty() {
+            for ch in port.chars() {
+                if !ch.is_ascii_digit() {
+                    return Err(format!("invalid port in CAA iodef URL: {port}").into());
+                }
+            }
+        }
+    } else {
+        return Err(format!("unsupported CAA iodef URL scheme: {scheme}").into());
+    }
+
+    Ok(url.to_owned())
 }
 
-/// Issuer key and value pairs.
+const URL_CHARS: &[char] = &[
+    '/', ':', '.', '?', '#', '@', '-', '_', '%', ',', '=', '[', ']',
+];
+
+/// Issuer parameter key-value pairs.
 ///
 /// [RFC 8659, DNS Certification Authority Authorization, November 2019](https://www.rfc-editor.org/rfc/rfc8659#section-4.2)
 /// for more explanation.
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct KeyValue {
     key: String,
@@ -658,11 +643,11 @@ impl KeyValue {
 }
 
 // TODO: change this to return &str
-fn read_tag(decoder: &mut BinDecoder<'_>, len: Restrict<u8>) -> ProtoResult<String> {
+fn read_tag(decoder: &mut BinDecoder<'_>, len: Restrict<u8>) -> Result<String, DecodeError> {
     let len = len
         .map(|len| len as usize)
         .verify_unwrap(|len| *len > 0 && *len <= 15)
-        .map_err(|_| ProtoError::from("CAA tag length out of bounds, 1-15"))?;
+        .map_err(|_| DecodeError::CaaTagInvalid)?;
     let mut tag = String::with_capacity(len);
 
     for _ in 0..len {
@@ -670,7 +655,7 @@ fn read_tag(decoder: &mut BinDecoder<'_>, len: Restrict<u8>) -> ProtoResult<Stri
             .pop()?
             .map(char::from)
             .verify_unwrap(|ch| matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9'))
-            .map_err(|_| ProtoError::from("CAA tag character(s) out of bounds"))?;
+            .map_err(|_| DecodeError::CaaTagInvalid)?;
 
         tag.push(ch);
     }
@@ -679,12 +664,9 @@ fn read_tag(decoder: &mut BinDecoder<'_>, len: Restrict<u8>) -> ProtoResult<Stri
 }
 
 /// writes out the tag in binary form to the buffer, returning the number of bytes written
-fn emit_tag(buf: &mut [u8], tag: &Property) -> ProtoResult<u8> {
-    let property = tag.as_str();
-    let property = property.as_bytes();
-
-    let len = property.len();
-    if len > ::std::u8::MAX as usize {
+fn emit_tag(buf: &mut [u8], tag: &str) -> ProtoResult<u8> {
+    let len = tag.len();
+    if len > u8::MAX as usize {
         return Err(format!("CAA property too long: {len}").into());
     }
     if buf.len() < len {
@@ -698,28 +680,23 @@ fn emit_tag(buf: &mut [u8], tag: &Property) -> ProtoResult<u8> {
 
     // copy into the buffer
     let buf = &mut buf[0..len];
-    buf.copy_from_slice(property);
+    buf.copy_from_slice(tag.as_bytes());
 
     Ok(len as u8)
 }
 
 impl BinEncodable for CAA {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        let mut flags = 0_u8;
-
-        if self.issuer_critical {
-            flags |= 0b1000_0000;
-        }
-
-        encoder.emit(flags)?;
+        let mut encoder = encoder.with_rdata_behavior(RDataEncoding::Other);
+        self.flags().emit(&mut encoder)?;
         // TODO: it might be interesting to use the new place semantics here to output all the data, then place the length back to the beginning...
-        let mut tag_buf = [0_u8; ::std::u8::MAX as usize];
+        let mut tag_buf = [0_u8; u8::MAX as usize];
         let len = emit_tag(&mut tag_buf, &self.tag)?;
 
         // now write to the encoder
-        encoder.emit(len)?;
-        encoder.emit_vec(&tag_buf[0..len as usize])?;
-        emit_value(encoder, &self.value)?;
+        len.emit(&mut encoder)?;
+        encoder.emit_slice(&tag_buf[0..len as usize])?;
+        encoder.emit_slice(&self.value)?;
 
         Ok(())
     }
@@ -731,96 +708,83 @@ impl<'r> RecordDataDecodable<'r> for CAA {
     /// [RFC 8659, DNS Certification Authority Authorization, November 2019](https://www.rfc-editor.org/rfc/rfc8659#section-4.1)
     ///
     /// ```text
-    /// 5.1.  Syntax
+    /// 4.1.  Syntax
     ///
-    ///   A CAA RR contains a single property entry consisting of a tag-value
-    ///   pair.  Each tag represents a property of the CAA record.  The value
-    ///   of a CAA property is that specified in the corresponding value field.
+    /// A CAA RR contains a single Property consisting of a tag-value pair.
+    /// An FQDN MAY have multiple CAA RRs associated with it, and a given
+    /// Property Tag MAY be specified more than once across those RRs.
     ///
-    ///   A domain name MAY have multiple CAA RRs associated with it and a
-    ///   given property MAY be specified more than once.
+    /// The RDATA section for a CAA RR contains one Property.  A Property
+    /// consists of the following:
     ///
-    ///   The CAA data field contains one property entry.  A property entry
-    ///   consists of the following data fields:
+    /// +0-1-2-3-4-5-6-7-|0-1-2-3-4-5-6-7-|
+    /// | Flags          | Tag Length = n |
+    /// +----------------|----------------+...+---------------+
+    /// | Tag char 0     | Tag char 1     |...| Tag char n-1  |
+    /// +----------------|----------------+...+---------------+
+    /// +----------------|----------------+.....+----------------+
+    /// | Value byte 0   | Value byte 1   |.....| Value byte m-1 |
+    /// +----------------|----------------+.....+----------------+
     ///
-    ///   +0-1-2-3-4-5-6-7-|0-1-2-3-4-5-6-7-|
-    ///   | Flags          | Tag Length = n |
-    ///   +----------------+----------------+...+---------------+
-    ///   | Tag char 0     | Tag char 1     |...| Tag char n-1  |
-    ///   +----------------+----------------+...+---------------+
-    ///   +----------------+----------------+.....+----------------+
-    ///   | Value byte 0   | Value byte 1   |.....| Value byte m-1 |
-    ///   +----------------+----------------+.....+----------------+
+    /// Where n is the length specified in the Tag Length field and m is the
+    /// number of remaining octets in the Value field.  They are related by
+    /// (m = d - n - 2) where d is the length of the RDATA section.
     ///
-    ///   Where n is the length specified in the Tag length field and m is the
-    ///   remaining octets in the Value field (m = d - n - 2) where d is the
-    ///   length of the RDATA section.
+    /// The fields are defined as follows:
     ///
-    ///   The data fields are defined as follows:
+    /// Flags:  One octet containing the following field:
     ///
-    ///   Flags:  One octet containing the following fields:
+    ///    Bit 0, Issuer Critical Flag:  If the value is set to "1", the
+    ///       Property is critical.  A CA MUST NOT issue certificates for any
+    ///       FQDN if the Relevant RRset for that FQDN contains a CAA
+    ///       critical Property for an unknown or unsupported Property Tag.
     ///
-    ///      Bit 0, Issuer Critical Flag:  If the value is set to '1', the
-    ///         critical flag is asserted and the property MUST be understood
-    ///         if the CAA record is to be correctly processed by a certificate
-    ///         issuer.
+    /// Note that according to the conventions set out in [RFC1035], bit 0 is
+    /// the Most Significant Bit and bit 7 is the Least Significant Bit.
+    /// Thus, according to those conventions, the Flags value 1 means that
+    /// bit 7 is set, while a value of 128 means that bit 0 is set.
     ///
-    ///         A Certification Authority MUST NOT issue certificates for any
-    ///         Domain that contains a CAA critical property for an unknown or
-    ///         unsupported property tag that for which the issuer critical
-    ///         flag is set.
+    /// All other bit positions are reserved for future use.
     ///
-    ///      Note that according to the conventions set out in [RFC1035], bit 0
-    ///      is the Most Significant Bit and bit 7 is the Least Significant
-    ///      Bit. Thus, the Flags value 1 means that bit 7 is set while a value
-    ///      of 128 means that bit 0 is set according to this convention.
+    /// To ensure compatibility with future extensions to CAA, DNS records
+    /// compliant with this version of the CAA specification MUST clear (set
+    /// to "0") all reserved flag bits.  Applications that interpret CAA
+    /// records MUST ignore the value of all reserved flag bits.
     ///
-    ///      All other bit positions are reserved for future use.
+    /// Tag Length:  A single octet containing an unsigned integer specifying
+    ///    the tag length in octets.  The tag length MUST be at least 1.
     ///
-    ///      To ensure compatibility with future extensions to CAA, DNS records
-    ///      compliant with this version of the CAA specification MUST clear
-    ///      (set to "0") all reserved flags bits.  Applications that interpret
-    ///      CAA records MUST ignore the value of all reserved flag bits.
+    /// Tag:  The Property identifier -- a sequence of ASCII characters.
     ///
-    ///   Tag Length:  A single octet containing an unsigned integer specifying
-    ///      the tag length in octets.  The tag length MUST be at least 1 and
-    ///      SHOULD be no more than 15.
+    /// Tags MAY contain ASCII characters "a" through "z", "A" through "Z",
+    /// and the numbers 0 through 9.  Tags MUST NOT contain any other
+    /// characters.  Matching of tags is case insensitive.
     ///
-    ///   Tag:  The property identifier, a sequence of US-ASCII characters.
+    /// Tags submitted for registration by IANA MUST NOT contain any
+    /// characters other than the (lowercase) ASCII characters "a" through
+    /// "z" and the numbers 0 through 9.
     ///
-    ///      Tag values MAY contain US-ASCII characters 'a' through 'z', 'A'
-    ///      through 'Z', and the numbers 0 through 9.  Tag values SHOULD NOT
-    ///      contain any other characters.  Matching of tag values is case
-    ///      insensitive.
+    /// Value:  A sequence of octets representing the Property Value.
+    ///    Property Values are encoded as binary values and MAY employ
+    ///    sub-formats.
     ///
-    ///      Tag values submitted for registration by IANA MUST NOT contain any
-    ///      characters other than the (lowercase) US-ASCII characters 'a'
-    ///      through 'z' and the numbers 0 through 9.
-    ///
-    ///   Value:  A sequence of octets representing the property value.
-    ///      Property values are encoded as binary values and MAY employ sub-
-    ///      formats.
-    ///
-    ///      The length of the value field is specified implicitly as the
-    ///      remaining length of the enclosing Resource Record data field.
+    /// The length of the Value field is specified implicitly as the
+    /// remaining length of the enclosing RDATA section.
     /// ```
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<CAA> {
-        // the spec declares that other flags should be ignored for future compatibility...
-        let issuer_critical: bool =
-            decoder.read_u8()?.unverified(/*used as bitfield*/) & 0b1000_0000 != 0;
+    fn read_data(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
+        let flags = decoder.read_u8()?.unverified(/*used as bitfield*/);
+
+        let issuer_critical = (flags & 0b1000_0000) != 0;
+        let reserved_flags = flags & 0b0111_1111;
 
         let tag_len = decoder.read_u8()?;
-        let value_len: Restrict<u16> = length
-            .checked_sub(u16::from(tag_len.unverified(/*safe usage here*/)))
-            .checked_sub(2)
-            .map_err(|_| ProtoError::from("CAA tag character(s) out of bounds"))?;
-
         let tag = read_tag(decoder, tag_len)?;
-        let tag = Property::from(tag);
-        let value = read_value(&tag, decoder, value_len)?;
+
+        let value = decoder.read_vec_to_end().unverified(/* stored as uninterpreted data */);
 
         Ok(CAA {
             issuer_critical,
+            reserved_flags,
             tag,
             value,
         })
@@ -828,13 +792,6 @@ impl<'r> RecordDataDecodable<'r> for CAA {
 }
 
 impl RecordData for CAA {
-    fn try_from_rdata(data: RData) -> Result<Self, RData> {
-        match data {
-            RData::CAA(csync) => Ok(csync),
-            _ => Err(data),
-        }
-    }
-
     fn try_borrow(data: &RData) -> Option<&Self> {
         match data {
             RData::CAA(csync) => Some(csync),
@@ -851,66 +808,15 @@ impl RecordData for CAA {
     }
 }
 
-impl fmt::Display for Property {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        let s = match self {
-            Self::Issue => "issue",
-            Self::IssueWild => "issuewild",
-            Self::Iodef => "iodef",
-            Self::Unknown(s) => s,
-        };
-
-        f.write_str(s)
-    }
-}
-
-impl fmt::Display for Value {
-    // https://www.rfc-editor.org/rfc/rfc8659#section-4.1.1
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        f.write_str("\"")?;
-
-        match self {
-            Value::Issuer(name, values) => {
-                if let Some(name) = name {
-                    write!(f, "{name}")?;
-                }
-                for value in values.iter() {
-                    write!(f, "; {value}")?;
-                }
-            }
-            Value::Url(url) => write!(f, "{url}")?,
-            Value::Unknown(v) => match str::from_utf8(v) {
-                Ok(text) => write!(f, "{text}")?,
-                Err(_) => return Err(fmt::Error),
-            },
-        }
-
-        f.write_str("\"")
-    }
-}
-
-impl fmt::Display for KeyValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        f.write_str(&self.key)?;
-        if !self.value.is_empty() {
-            write!(f, "={}", self.value)?;
-        }
-
-        Ok(())
-    }
-}
-
 // FIXME: this needs to be verified to be correct, add tests...
 impl fmt::Display for CAA {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        let critical = if self.issuer_critical { "128" } else { "0" };
-
         write!(
             f,
-            "{critical} {tag} {value}",
-            critical = critical,
+            "{flags} {tag} \"{value}\"",
+            flags = self.flags(),
             tag = self.tag,
-            value = self.value
+            value = String::from_utf8_lossy(&self.value)
         )
     }
 }
@@ -919,9 +825,9 @@ impl fmt::Display for CAA {
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
-    use std::str;
-
-    use crate::error::ProtoErrorKind;
+    use alloc::{str, string::ToString};
+    #[cfg(feature = "std")]
+    use std::println;
 
     use super::*;
 
@@ -958,17 +864,6 @@ mod tests {
         let mut decoder = BinDecoder::new(too_long);
 
         assert!(read_tag(&mut decoder, Restrict::new(too_long.len() as u8)).is_err());
-    }
-
-    #[test]
-    fn test_from_str_property() {
-        assert_eq!(Property::from("Issue".to_string()), Property::Issue);
-        assert_eq!(Property::from("issueWild".to_string()), Property::IssueWild);
-        assert_eq!(Property::from("iodef".to_string()), Property::Iodef);
-        assert_eq!(
-            Property::from("unknown".to_string()),
-            Property::Unknown("unknown".to_string())
-        );
     }
 
     #[test]
@@ -1032,18 +927,52 @@ mod tests {
             )
         );
         assert_eq!(read_issuer(b";").unwrap(), (None, vec![]));
+        read_issuer(b"example.com; param=\xff").unwrap_err();
     }
 
     #[test]
     fn test_read_iodef() {
-        assert_eq!(
-            read_iodef(b"mailto:security@example.com").unwrap(),
-            Url::parse("mailto:security@example.com").unwrap()
-        );
-        assert_eq!(
-            read_iodef(b"https://iodef.example.com/").unwrap(),
-            Url::parse("https://iodef.example.com/").unwrap()
-        );
+        for valid in [
+            "mailto:security@example.com",
+            "mailto:a@example.com,b@example.org?subject=CAA%20report",
+            "MAILTO:security@example.com",
+            "https://iodef.example.com/",
+            "http://iodef.example.com",
+            "HTTPS://user:pass@iodef.example.com:8443/report?id=1#top",
+            "https://192.0.2.1/",
+            "https://[2001:db8::1]:443/",
+            "https://iodef.example.com:/",
+        ] {
+            assert_eq!(read_iodef(valid.as_bytes()).unwrap(), valid);
+        }
+
+        for invalid in [
+            b"".as_slice(),
+            b"iodef.example.com",
+            b"ftp://iodef.example.com/",
+            b"tel:+1-201-555-0123",
+            b"https:iodef.example.com",
+            b"https://",
+            b"https:///report",
+            b"https://user@:443/",
+            b"https://iodef.example.com:44a/",
+            b"https://[2001:db8::1/",
+            b"https://[not-an-address]/",
+            b"https://[2001:db8::1]x/",
+            b"https://iodef.example]com/",
+            b"https://iodef.example.com/a b",
+            b"https://iodef.example.com/\"",
+            b"https://iodef.ex\xc3\xa4mple.com/",
+            b"https://iodef.example.com/\xff",
+            b"mailto:",
+            b"mailto:?subject=report",
+            b"mailto:security",
+            b"mailto:@example.com",
+            b"mailto:security@",
+            b"mailto:a@example.com,,b@example.org",
+        ] {
+            read_iodef(invalid).unwrap_err();
+        }
     }
 
     fn test_encode_decode(rdata: CAA) {
@@ -1052,11 +981,11 @@ mod tests {
         rdata.emit(&mut encoder).expect("failed to emit caa");
         let bytes = encoder.into_bytes();
 
+        #[cfg(feature = "std")]
         println!("bytes: {bytes:?}");
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
-        let read_rdata = CAA::read_data(&mut decoder, Restrict::new(bytes.len() as u16))
-            .expect("failed to read back");
+        let read_rdata = CAA::read_data(&mut decoder).expect("failed to read back");
         assert_eq!(rdata, read_rdata);
     }
 
@@ -1085,6 +1014,13 @@ mod tests {
             Some(Name::parse("example.com.", None).unwrap()),
             vec![],
         ));
+        // invalid name
+        test_encode_decode(CAA {
+            issuer_critical: false,
+            reserved_flags: 0,
+            tag: "issue".to_string(),
+            value: b"%%%%%".to_vec(),
+        });
     }
 
     #[test]
@@ -1095,14 +1031,25 @@ mod tests {
 
     #[test]
     fn test_encode_decode_iodef() {
-        test_encode_decode(CAA::new_iodef(
-            true,
-            Url::parse("https://www.example.com").unwrap(),
-        ));
-        test_encode_decode(CAA::new_iodef(
-            false,
-            Url::parse("mailto:root@example.com").unwrap(),
-        ));
+        test_encode_decode(CAA::new_iodef(true, "https://www.example.com"));
+        test_encode_decode(CAA::new_iodef(false, "mailto:root@example.com"));
+        // invalid UTF-8
+        test_encode_decode(CAA {
+            issuer_critical: false,
+            reserved_flags: 0,
+            tag: "iodef".to_string(),
+            value: vec![0xff],
+        });
+    }
+
+    #[test]
+    fn test_encode_decode_unknown() {
+        test_encode_decode(CAA {
+            issuer_critical: true,
+            reserved_flags: 0,
+            tag: "tbs".to_string(),
+            value: b"Unknown".to_vec(),
+        });
     }
 
     fn test_encode(rdata: CAA, encoded: &[u8]) {
@@ -1148,7 +1095,7 @@ mod tests {
     #[test]
     fn test_to_string() {
         let deny = CAA::new_issue(false, None, vec![]);
-        assert_eq!(deny.to_string(), "0 issue \"\"");
+        assert_eq!(deny.to_string(), "0 issue \";\"");
 
         let empty_options = CAA::new_issue(
             false,
@@ -1211,17 +1158,18 @@ mod tests {
             "0 issue \"ca.example.net; policy=ev\""
         );
         assert_eq!(
-            CAA::new_iodef(false, Url::parse("mailto:security@example.com").unwrap()).to_string(),
+            CAA::new_iodef(false, "mailto:security@example.com").to_string(),
             "0 iodef \"mailto:security@example.com\""
         );
         assert_eq!(
-            CAA::new_iodef(false, Url::parse("https://iodef.example.com/").unwrap()).to_string(),
+            CAA::new_iodef(false, "https://iodef.example.com/").to_string(),
             "0 iodef \"https://iodef.example.com/\""
         );
         let unknown = CAA {
             issuer_critical: true,
-            tag: Property::from("tbs".to_string()),
-            value: Value::Unknown("Unknown".as_bytes().to_vec()),
+            reserved_flags: 0,
+            tag: "tbs".to_string(),
+            value: b"Unknown".to_vec(),
         };
         assert_eq!(unknown.to_string(), "128 tbs \"Unknown\"");
     }
@@ -1235,10 +1183,116 @@ mod tests {
         ];
 
         let mut decoder = BinDecoder::new(MESSAGE);
-        let err = CAA::read_data(&mut decoder, Restrict::new(MESSAGE.len() as u16)).unwrap_err();
-        match err.kind() {
-            ProtoErrorKind::Msg(msg) => assert_eq!(msg, "bad character in CAA issuer key: ÿ"),
-            _ => panic!("unexpected error: {:?}", err),
+        let caa = CAA::read_data(&mut decoder).unwrap();
+        assert!(!caa.issuer_critical);
+        assert_eq!(caa.tag, "issue");
+        match (caa.value_as_issue(), caa.value_as_iodef()) {
+            (Err(_), Err(_)) => {}
+            _ => panic!("wrong value type"),
+        }
+        assert_eq!(caa.value, &MESSAGE[7..]);
+    }
+
+    #[test]
+    fn test_name_non_ascii_character_escaped_dots_roundtrip() {
+        const MESSAGE: &[u8] = b"\x00\x05issue\xe5\x85\x9edomain\\.\\.name";
+        let caa = CAA::read_data(&mut BinDecoder::new(MESSAGE)).unwrap();
+
+        let mut encoded = Vec::new();
+        caa.emit(&mut BinEncoder::new(&mut encoded)).unwrap();
+
+        let caa_round_trip = CAA::read_data(&mut BinDecoder::new(&encoded)).unwrap();
+
+        assert_eq!(caa, caa_round_trip);
+    }
+
+    #[test]
+    fn test_reserved_flags_round_trip() {
+        let mut original = *b"\x00\x05issueexample.com";
+        for flags in 0..=u8::MAX {
+            original[0] = flags;
+            let caa = CAA::read_data(&mut BinDecoder::new(&original)).unwrap();
+
+            let mut encoded = Vec::new();
+            caa.emit(&mut BinEncoder::new(&mut encoded)).unwrap();
+            assert_eq!(original.as_slice(), &encoded);
+        }
+    }
+
+    #[test]
+    fn test_parsing() {
+        //nocerts       CAA 0 issue \";\"
+        assert!(CAA::from_tokens(vec!["0", "issue", ";"].into_iter()).is_ok());
+
+        // certs         CAA 0 issuewild \"example.net\"
+        assert!(CAA::from_tokens(vec!["0", "issue", "example.net"].into_iter()).is_ok());
+
+        // issuer critical = true
+        test_to_string_parse_is_reversible(CAA::new_issue(true, None, vec![]), "128 issue \";\"");
+
+        // deny
+        test_to_string_parse_is_reversible(CAA::new_issue(false, None, vec![]), "0 issue \";\"");
+
+        // only hostname
+        test_to_string_parse_is_reversible(
+            CAA::new_issue(
+                false,
+                Some(Name::parse("example.com", None).unwrap()),
+                vec![],
+            ),
+            "0 issue \"example.com\"",
+        );
+
+        // hostname and one parameter
+        test_to_string_parse_is_reversible(
+            CAA::new_issue(
+                false,
+                Some(Name::parse("example.com", None).unwrap()),
+                vec![KeyValue::new("one", "1")],
+            ),
+            "0 issue \"example.com; one=1\"",
+        );
+
+        // hostname and two parameters
+        test_to_string_parse_is_reversible(
+            CAA::new_issue(
+                false,
+                Some(Name::parse("example.com", None).unwrap()),
+                vec![KeyValue::new("one", "1"), KeyValue::new("two", "2")],
+            ),
+            "0 issue \"example.com; one=1; two=2\"",
+        );
+
+        // no hostname and one parameter
+        test_to_string_parse_is_reversible(
+            CAA::new_issue(false, None, vec![KeyValue::new("one", "1")]),
+            "0 issue \"; one=1\"",
+        );
+
+        // no hostname and two parameters
+        test_to_string_parse_is_reversible(
+            CAA::new_issue(
+                false,
+                None,
+                vec![KeyValue::new("one", "1"), KeyValue::new("two", "2")],
+            ),
+            "0 issue \"; one=1; two=2\"",
+        );
+    }
+
+    fn test_to_string_parse_is_reversible(expected_rdata: CAA, input_string: &str) {
+        let expected_rdata_string = expected_rdata.to_string();
+        assert_eq!(
+            input_string, expected_rdata_string,
+            "input string does not match expected_rdata.to_string()"
+        );
+
+        match RData::try_from_str(RecordType::CAA, input_string).expect("CAA rdata parse failed") {
+            RData::CAA(parsed_rdata) => assert_eq!(
+                expected_rdata, parsed_rdata,
+                "CAA rdata was not parsed as expected. input={input_string:?} expected_rdata={expected_rdata:?} parsed_rdata={parsed_rdata:?}",
+            ),
+            parsed_rdata => panic!("Parsed RData is not CAA: {:?}", parsed_rdata),
         }
     }
 }

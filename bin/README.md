@@ -1,55 +1,117 @@
 # Overview
 
-Hickory DNS provides a binary for hosting or forwarding DNS zones.
+This crate provides a `hickory-dns` application, a safe and secure DNS server with a variety of 
+protocol features (DNSSEC, TSIG, SIG(0), DoT, DoQ, DoH). It can be operated as an authoritative
+DNS server, forwarding resolver, stub resolver, or a recursive resolver (experimental).
+Zone data can be managed in-memory, with flat files, or with an SQLite database.
 
-This a named implementation for DNS zone hosting. It is capable of performing signing all records in the zone for server DNSSEC RRSIG records associated with all records in a zone. There is also a `hickory-dns` binary that can be generated from the library with `cargo install hickory-dns`. Dynamic updates are supported via `SIG0` (an mTLS authentication method is under development).
+If you are writing your own Rust application, refer to the [`hickory-server`], [`hickory-net`],
+and [`hickory-resolver`] library crates instead.
 
-**NOTICE** This project was rebranded fromt Trust-DNS to Hickory DNS and has been moved to the https://github.com/hickory-dns/hickory-dns organization and repo, this crate/binary has been moved to [hickory-dns](https://crates.io/crates/hickory-dns), from `0.24` and onward, for prior versions see [trust-dns](https://crates.io/crates/trust-dns).
+[`hickory-server`]: ../crates/server
+[`hickory-net`]: ../crates/net
+[`hickory-resolver`]: ../crates/resolver
 
 ## Features
 
 - Dynamic Update with sqlite journaling backend (SIG0)
-- DNSSEC online signing (NSEC not NSEC3)
-- DNS over TLS (DoT)
-- DNS over HTTPS/2 (DoH)
-- DNS over HTTPS/3 (DoH3)
-- DNS over Quic (DoQ)
+- DNSSEC online signing (with NSEC and NSEC3)
 - Forwarding stub resolver
-- ANAME resolution, for zone mapping aliass to A and AAAA records
+- ANAME resolution, for zone mapping aliases to A and AAAA records
 - Additionals section generation for aliasing record types
 
-## DNS-over-TLS and DNS-over-HTTPS
+## Cryptography provider
 
-Support of TLS on the Server is managed through a pkcs12 der file. The documentation is captured in the example test config file, [example.toml](https://github.com/hickory-dns/hickory-dns/blob/main/tests/test-data/test_configs/example.toml). A registered certificate to the server can be pinned to the Client with the `add_ca()` method. Alternatively, as the client uses the rust-native-tls library, it should work with certificate signed by any standard CA.
+Features requiring cryptography require selecting a specific cryptography 
+provider. See the [project README] for more information.
 
-DoT and DoH are supported. This is accomplished through the use of one of `native-tls`, `openssl`, or `rustls` (only `rustls` is currently supported for DoH). The Resolver requires valid DoT or DoH resolvers being registered in order to be used.
+[project README]: ../README.md#Cryptography-provider
 
-To use with the `Client`, the `TlsClientConnection` or `HttpsClientConnection` should be used. Similarly, to use with the tokio `AsyncClient` the `TlsClientStream` or `HttpsClientStream` should be used. ClientAuth, mTLS, is currently not supported, there are some issues still being worked on. TLS is useful for Server authentication and connection privacy.
+## Protocol support
 
-To enable DoT one of the features `dns-over-native-tls`, `dns-over-openssl`, or `dns-over-rustls` must be enabled, `dns-over-https-rustls` is used for DoH.
+The following DNS protocols are optionally supported:
 
-## DNSSEC status
+* DNS over TLS (DoT)
+* DNS over HTTP/2 (DoH)
+* DNS over QUIC (DoQ)
+* DNS over HTTP/3 (DoH3)
 
-Currently the root key is hardcoded into the system. This gives validation of
-DNSKEY and DS records back to the root. NSEC is implemented, but not NSEC3.
-Because caching is not yet enabled, it has been noticed that some DNS servers
-appear to rate limit the connections, validating RRSIG records back to the root
-can require a significant number of additional queries for those records.
+In order to use these optional protocols you must enable a cargo feature
+corresponding to your desired cryptography provider:
 
-Zones will be automatically resigned on any record updates via dynamic DNS. To enable DNSSEC, one of the features `dnssec-openssl` or `dnssec-ring` must be enabled.
+* DoT: `tls-aws-lc-rs` or `tls-ring`
+* DoH: `https-aws-lc-rs` or `https-ring`
+* DoQ: `quic-aws-lc-rs` or `quic-ring`
+* DoH3: `h3-aws-lc-rs` or `h3-ring`
 
-## Future goals
+## DNSSEC
 
-- Distributed dynamic DNS updates, with consensus
-- mTLS based authorization for Dynamic Updates
-- Online NSEC creation for queries
-- Full hint based resolving
-- Maybe NSEC3 and/or NSEC5 support
+In order to use DNSSEC you must enable a cargo feature corresponding to your 
+desired cryptography provider:
 
-## Minimum Rust Version
+* `dnssec-aws-lc-rs`
+* `dnssec-ring`
 
-The current minimum rustc version for this project is `1.67`
+The current root key is bundled into the system, and used by default. This gives
+validation of DNSKEY and DS records back to the root. NSEC and NSEC3 are
+implemented.
 
-## Versioning
+When using dynamic DNS, zones will be automatically resigned on any record updates.
 
-Hickory DNS does it's best job to follow semver. Hickory DNS will be promoted to 1.0 upon stabilization of the publicly exposed APIs. This does not mean that Hickory DNS will necessarily break on upgrades between 0.x updates. Whenever possible, old APIs will be deprecated with notes on what replaced those deprecations. Hickory DNS will make a best effort to never break software which depends on it due to API changes, though this can not be guaranteed. Deprecated interfaces will be maintained for at minimum one major release after that in which they were deprecated (where possible), with the exception of the upgrade to 1.0 where all deprecated interfaces will be planned to be removed.
+## Other crate features
+
+* `sqlite` (enabled by default) - support maintaining zone data in a SQLite database.
+  Required for dynamic DNS support.
+* `blocklist` - support configuring allow/deny blocklists.
+* `recursor` - enable experimental support for recursive resolution.
+* `resolver` (enabled by default) - enable forwarding zones to another resolver.
+* `rustls-platform-verifier` (enabled by default) - use the system verifier for TLS with
+   [rustls-platform-verifier].
+* `webpki-roots` - use the [webpki-roots] crate for TLS certificate verification.
+* `prometheus-metrics` - enable exposing [Prometheus] metrics for scraping.
+* `systemd` - enable [systemd] readiness (`READY=1`/`STOPPING=1`) and watchdog notifications.
+* `ascii-art` (enabled by default) - print project logo at start.
+
+[rustls-platform-verifier]: https://crates.io/crates/rustls-platform-verifier
+[webpki-roots]: https://crates.io/crates/webpki-roots
+[Prometheus]: https://prometheus.io/
+[systemd]: https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html
+
+## Running
+
+Warning: Hickory DNS is still under development, running in production is not
+recommended.
+
+- Building
+
+```shell
+cargo build --release --bin hickory-dns
+```
+
+- Verify the version
+
+```shell
+./target/release/hickory-dns --version
+```
+
+- Get help
+
+```shell
+./target/release/hickory-dns --help
+```
+
+- Launch `hickory-dns` server with test config
+
+Note that if the `-p` parameter is not passed, the server will run on default
+DNS ports. There are separate port options for DoT and DoH servers, see
+`hickory-dns --help`
+
+```shell
+./target/release/hickory-dns -c ./tests/test-data/test_configs/example.toml -z ./tests/test-data/test_configs/ -p 24141
+```
+
+- Query the just launched server with `dig`
+
+```shell
+dig @127.0.0.1 -p 24141 www.example.com
+```

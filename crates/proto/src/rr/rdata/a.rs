@@ -31,38 +31,48 @@
 //! "10.2.0.52" or "192.0.5.6").
 //! ```
 
-pub use std::net::Ipv4Addr;
-use std::{fmt, net::AddrParseError, ops::Deref, str};
+use alloc::string::ToString;
+pub use core::net::Ipv4Addr;
+use core::{
+    fmt,
+    net::AddrParseError,
+    ops::Deref,
+    str::{self, FromStr},
+};
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::*,
     rr::{RData, RecordData, RecordType},
-    serialize::binary::*,
+    serialize::{binary::*, txt::ParseError},
 };
 
 /// The DNS A record type, an IPv4 address
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct A(pub Ipv4Addr);
 
 impl A {
-    /// Construct a new AAAA record with the 32 bits of IPv4 address
+    /// Construct a new A record with the 32 bits of IPv4 address
     pub const fn new(a: u8, b: u8, c: u8, d: u8) -> Self {
         Self(Ipv4Addr::new(a, b, c, d))
+    }
+
+    /// Parse the RData from a set of Tokens
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        mut tokens: I,
+    ) -> Result<Self, ParseError> {
+        let address: Ipv4Addr = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("ipv4 address".to_string()))
+            .and_then(|s| Ipv4Addr::from_str(s).map_err(Into::into))?;
+        Ok(address.into())
     }
 }
 
 impl RecordData for A {
-    fn try_from_rdata(data: RData) -> Result<Self, crate::rr::RData> {
-        match data {
-            RData::A(ipv4) => Ok(ipv4),
-            _ => Err(data),
-        }
-    }
-
     fn try_borrow(data: &RData) -> Option<&Self> {
         match data {
             RData::A(ipv4) => Some(ipv4),
@@ -81,18 +91,12 @@ impl RecordData for A {
 
 impl BinEncodable for A {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        let segments = self.octets();
-
-        encoder.emit(segments[0])?;
-        encoder.emit(segments[1])?;
-        encoder.emit(segments[2])?;
-        encoder.emit(segments[3])?;
-        Ok(())
+        encoder.emit_slice(&self.octets())
     }
 }
 
 impl<'r> BinDecodable<'r> for A {
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         // TODO: would this be more efficient as a single u32 read?
         Ok(Ipv4Addr::new(
             decoder.pop()?.unverified(/*valid as any u8*/),
@@ -102,18 +106,6 @@ impl<'r> BinDecodable<'r> for A {
         )
         .into())
     }
-}
-
-/// Read the RData from the given Decoder
-#[deprecated(note = "use the BinDecodable::read method instead")]
-pub fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<A> {
-    <A as BinDecodable>::read(decoder)
-}
-
-/// Write the RData from the given Decoder
-#[deprecated(note = "use the BinEncodable::emit method instead")]
-pub fn emit(encoder: &mut BinEncoder<'_>, address: Ipv4Addr) -> ProtoResult<()> {
-    BinEncodable::emit(&A::from(address), encoder)
 }
 
 impl From<Ipv4Addr> for A {
@@ -142,7 +134,7 @@ impl fmt::Display for A {
     }
 }
 
-impl str::FromStr for A {
+impl FromStr for A {
     type Err = AddrParseError;
     fn from_str(s: &str) -> Result<Self, AddrParseError> {
         Ipv4Addr::from_str(s).map(From::from)
@@ -151,21 +143,21 @@ impl str::FromStr for A {
 
 #[cfg(test)]
 mod mytests {
-    use std::str::FromStr;
+    use alloc::vec::Vec;
 
     use super::*;
     use crate::serialize::binary::bin_tests::{test_emit_data_set, test_read_data_set};
 
     fn get_data() -> Vec<(A, Vec<u8>)> {
         vec![
-            (A::from_str("0.0.0.0").unwrap(), vec![0, 0, 0, 0]), // base case
-            (A::from_str("1.0.0.0").unwrap(), vec![1, 0, 0, 0]),
-            (A::from_str("0.1.0.0").unwrap(), vec![0, 1, 0, 0]),
-            (A::from_str("0.0.1.0").unwrap(), vec![0, 0, 1, 0]),
-            (A::from_str("0.0.0.1").unwrap(), vec![0, 0, 0, 1]),
-            (A::from_str("127.0.0.1").unwrap(), vec![127, 0, 0, 1]),
+            (A::from(Ipv4Addr::UNSPECIFIED), vec![0, 0, 0, 0]), // base case
+            (A::from(Ipv4Addr::new(1, 0, 0, 0)), vec![1, 0, 0, 0]),
+            (A::from(Ipv4Addr::new(0, 1, 0, 0)), vec![0, 1, 0, 0]),
+            (A::from(Ipv4Addr::new(0, 0, 1, 0)), vec![0, 0, 1, 0]),
+            (A::from(Ipv4Addr::new(0, 0, 0, 1)), vec![0, 0, 0, 1]),
+            (A::from(Ipv4Addr::LOCALHOST), vec![127, 0, 0, 1]),
             (
-                A::from_str("192.168.64.32").unwrap(),
+                A::from(Ipv4Addr::new(192, 168, 64, 32)),
                 vec![192, 168, 64, 32],
             ),
         ]
@@ -173,11 +165,11 @@ mod mytests {
 
     #[test]
     fn test_parse() {
-        test_read_data_set(get_data(), |ref mut d| A::read(d));
+        test_read_data_set(get_data(), |mut d| A::read(&mut d));
     }
 
     #[test]
     fn test_write_to() {
-        test_emit_data_set(get_data(), |ref mut e, d| d.emit(e));
+        test_emit_data_set(get_data(), |e, d| d.emit(e));
     }
 }

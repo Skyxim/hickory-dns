@@ -6,19 +6,21 @@
 // copied, modified, or distributed except according to those terms.
 
 //! TLSA records for storing TLS certificate validation information
-#![allow(clippy::use_self)]
 
-use std::fmt;
+use alloc::{string::String, vec::Vec};
+use core::fmt;
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use super::sshfp;
-
 use crate::{
-    error::{ProtoError, ProtoResult},
+    error::ProtoResult,
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
-    serialize::binary::{BinDecoder, BinEncodable, BinEncoder, Restrict, RestrictedMath},
+    serialize::{
+        binary::{BinDecoder, BinEncodable, BinEncoder, DecodeError},
+        txt::ParseError,
+    },
 };
 
 /// [RFC 6698, DNS-Based Authentication for TLS](https://tools.ietf.org/html/rfc6698#section-2.1)
@@ -40,13 +42,23 @@ use crate::{
 ///    /                                                               /
 ///    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct TLSA {
-    cert_usage: CertUsage,
-    selector: Selector,
-    matching: Matching,
-    cert_data: Vec<u8>,
+    /// Specifies the provided association that will be used to match the certificate
+    /// presented in the TLS handshake
+    pub cert_usage: CertUsage,
+
+    /// Specifies which part of the TLS certificate presented by the server will be
+    /// matched against the association data
+    pub selector: Selector,
+
+    /// Specifies how the certificate association is presented
+    pub matching: Matching,
+
+    /// Binary data for validating the cert, see other members to understand format
+    pub cert_data: Vec<u8>,
 }
 
 /// [RFC 6698, DNS-Based Authentication for TLS](https://tools.ietf.org/html/rfc6698#section-2.1.1)
@@ -75,7 +87,27 @@ pub struct TLSA {
 ///    that accept other formats for certificates, those certificates will
 ///    need their own certificate usage values.
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+///
+/// [RFC 7218, Adding Acronyms to DANE Registries](https://datatracker.ietf.org/doc/html/rfc7218#section-2.1)
+///
+/// ```text
+/// 2.1.  TLSA Certificate Usages Registry
+///
+///   The reference for this registry has been updated to include both
+///   [RFC6698] and this document.
+///
+///    +-------+----------+--------------------------------+-------------+
+///    | Value | Acronym  | Short Description              | Reference   |
+///    +-------+----------+--------------------------------+-------------+
+///    |   0   | PKIX-TA  | CA constraint                  | [RFC6698]   |
+///    |   1   | PKIX-EE  | Service certificate constraint | [RFC6698]   |
+///    |   2   | DANE-TA  | Trust anchor assertion         | [RFC6698]   |
+///    |   3   | DANE-EE  | Domain-issued certificate      | [RFC6698]   |
+///    | 4-254 |          | Unassigned                     |             |
+///    |  255  | PrivCert | Reserved for Private Use       | [RFC6698]   |
+///    +-------+----------+--------------------------------+-------------+
+/// ```
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum CertUsage {
     /// ```text
@@ -92,7 +124,8 @@ pub enum CertUsage {
     ///       the certificate might or might not have the basicConstraints
     ///       extension present.
     /// ```
-    CA,
+    #[cfg_attr(feature = "serde", serde(rename = "PKIX-TA"))]
+    PkixTa,
 
     /// ```text
     ///       1 -- Certificate usage 1 is used to specify an end entity
@@ -104,7 +137,8 @@ pub enum CertUsage {
     ///       certificate MUST pass PKIX certification path validation and MUST
     ///       match the TLSA record.
     /// ```
-    Service,
+    #[cfg_attr(feature = "serde", serde(rename = "PKIX-EE"))]
+    PkixEe,
 
     /// ```text
     ///       2 -- Certificate usage 2 is used to specify a certificate, or the
@@ -119,7 +153,8 @@ pub enum CertUsage {
     ///       certificate matching the TLSA record considered to be a trust
     ///       anchor for this certification path validation.
     /// ```
-    TrustAnchor,
+    #[cfg_attr(feature = "serde", serde(rename = "DANE-TA"))]
+    DaneTa,
 
     /// ```text
     ///       3 -- Certificate usage 3 is used to specify a certificate, or the
@@ -133,7 +168,8 @@ pub enum CertUsage {
     ///       requires that the certificate pass PKIX validation, but PKIX
     ///       validation is not tested for certificate usage 3.
     /// ```
-    DomainIssued,
+    #[cfg_attr(feature = "serde", serde(rename = "DANE-EE"))]
+    DaneEe,
 
     /// Unassigned at the time of this implementation
     Unassigned(u8),
@@ -145,10 +181,10 @@ pub enum CertUsage {
 impl From<u8> for CertUsage {
     fn from(usage: u8) -> Self {
         match usage {
-            0 => Self::CA,
-            1 => Self::Service,
-            2 => Self::TrustAnchor,
-            3 => Self::DomainIssued,
+            0 => Self::PkixTa,
+            1 => Self::PkixEe,
+            2 => Self::DaneTa,
+            3 => Self::DaneEe,
             4..=254 => Self::Unassigned(usage),
             255 => Self::Private,
         }
@@ -158,10 +194,10 @@ impl From<u8> for CertUsage {
 impl From<CertUsage> for u8 {
     fn from(usage: CertUsage) -> Self {
         match usage {
-            CertUsage::CA => 0,
-            CertUsage::Service => 1,
-            CertUsage::TrustAnchor => 2,
-            CertUsage::DomainIssued => 3,
+            CertUsage::PkixTa => 0,
+            CertUsage::PkixEe => 1,
+            CertUsage::DaneTa => 2,
+            CertUsage::DaneEe => 3,
             CertUsage::Unassigned(usage) => usage,
             CertUsage::Private => 255,
         }
@@ -186,19 +222,22 @@ impl From<CertUsage> for u8 {
 ///    unrelated to the use of "selector" in DomainKeys Identified Mail
 ///    (DKIM) [RFC6376].)
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum Selector {
     /// Full certificate: the Certificate binary structure as defined in [RFC5280](https://tools.ietf.org/html/rfc5280)
+    #[cfg_attr(feature = "serde", serde(rename = "Cert"))]
     Full,
 
     /// SubjectPublicKeyInfo: DER-encoded binary structure as defined in [RFC5280](https://tools.ietf.org/html/rfc5280)
+    #[cfg_attr(feature = "serde", serde(rename = "SPKI"))]
     Spki,
 
     /// Unassigned at the time of this writing
     Unassigned(u8),
 
     /// Private usage
+    #[cfg_attr(feature = "serde", serde(rename = "PrivSel"))]
     Private,
 }
 
@@ -245,22 +284,26 @@ impl From<Selector> for u8 {
 ///    certificate (if possible) will assist clients that support a small
 ///    number of hash algorithms.
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum Matching {
     /// Exact match on selected content
+    #[cfg_attr(feature = "serde", serde(rename = "Full"))]
     Raw,
 
     /// SHA-256 hash of selected content [RFC6234](https://tools.ietf.org/html/rfc6234)
+    #[cfg_attr(feature = "serde", serde(rename = "SHA2-256"))]
     Sha256,
 
     /// SHA-512 hash of selected content [RFC6234](https://tools.ietf.org/html/rfc6234)
+    #[cfg_attr(feature = "serde", serde(rename = "SHA2-512"))]
     Sha512,
 
     /// Unassigned at the time of this writing
     Unassigned(u8),
 
     /// Private usage
+    #[cfg_attr(feature = "serde", serde(rename = "PrivMatch"))]
     Private,
 }
 
@@ -321,38 +364,81 @@ impl TLSA {
         }
     }
 
-    /// Specifies the provided association that will be used to match the certificate presented in the TLS handshake
-    pub fn cert_usage(&self) -> CertUsage {
-        self.cert_usage
-    }
+    /// Parse the RData from a set of Tokens
+    ///
+    /// [RFC 6698, DNS-Based Authentication for TLS](https://tools.ietf.org/html/rfc6698#section-2.2)
+    ///
+    /// ```text
+    /// 2.2.  TLSA RR Presentation Format
+    ///
+    ///    The presentation format of the RDATA portion (as defined in
+    ///    [RFC1035]) is as follows:
+    ///
+    ///    o  The certificate usage field MUST be represented as an 8-bit
+    ///       unsigned integer.
+    ///
+    ///    o  The selector field MUST be represented as an 8-bit unsigned
+    ///       integer.
+    ///
+    ///    o  The matching type field MUST be represented as an 8-bit unsigned
+    ///       integer.
+    ///
+    ///    o  The certificate association data field MUST be represented as a
+    ///       string of hexadecimal characters.  Whitespace is allowed within
+    ///       the string of hexadecimal characters, as described in [RFC1035].
+    /// ```
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        tokens: I,
+    ) -> Result<Self, ParseError> {
+        let mut iter = tokens;
 
-    /// Specifies which part of the TLS certificate presented by the server will be matched against the association data
-    pub fn selector(&self) -> Selector {
-        self.selector
-    }
+        let token: &str = iter
+            .next()
+            .ok_or_else(|| ParseError::from("TLSA usage field missing"))?;
+        let cert_usage = CertUsage::from(to_u8(token)?);
 
-    /// Specifies how the certificate association is presented
-    pub fn matching(&self) -> Matching {
-        self.matching
-    }
+        let token = iter
+            .next()
+            .ok_or_else(|| ParseError::from("TLSA selector field missing"))?;
+        let selector = to_u8(token)?.into();
 
-    /// Binary data for validating the cert, see other members to understand format
-    pub fn cert_data(&self) -> &[u8] {
-        &self.cert_data
+        let token = iter
+            .next()
+            .ok_or_else(|| ParseError::from("TLSA matching field missing"))?;
+        let matching = to_u8(token)?.into();
+
+        // these are all in hex: "a string of hexadecimal characters"
+        //   aside: personally I find it funny that the other fields are decimal, while this is hex encoded...
+        let cert_data = iter.fold(String::new(), |mut cert_data, data| {
+            cert_data.push_str(data);
+            cert_data
+        });
+        let cert_data = sshfp::HEX.decode(cert_data.as_bytes())?;
+
+        if !cert_data.is_empty() {
+            Ok(Self {
+                cert_usage,
+                selector,
+                matching,
+                cert_data,
+            })
+        } else {
+            Err(ParseError::from("TLSA data field missing"))
+        }
     }
 }
 
 impl BinEncodable for TLSA {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u8(self.cert_usage.into())?;
-        encoder.emit_u8(self.selector.into())?;
-        encoder.emit_u8(self.matching.into())?;
-        encoder.emit_vec(&self.cert_data)?;
+        u8::from(self.cert_usage).emit(encoder)?;
+        u8::from(self.selector).emit(encoder)?;
+        u8::from(self.matching).emit(encoder)?;
+        encoder.emit_slice(&self.cert_data)?;
         Ok(())
     }
 }
 
-impl<'r> RecordDataDecodable<'r> for TLSA {
+impl RecordDataDecodable<'_> for TLSA {
     /// Read the RData from the given Decoder
     ///
     /// ```text
@@ -366,18 +452,13 @@ impl<'r> RecordDataDecodable<'r> for TLSA {
     ///    /                                                               /
     ///    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     /// ```
-    fn read_data(decoder: &mut BinDecoder<'_>, rdata_length: Restrict<u16>) -> ProtoResult<TLSA> {
+    fn read_data(decoder: &mut BinDecoder<'_>) -> Result<Self, DecodeError> {
         let cert_usage = decoder.read_u8()?.unverified(/*CertUsage is verified*/).into();
         let selector = decoder.read_u8()?.unverified(/*Selector is verified*/).into();
         let matching = decoder.read_u8()?.unverified(/*Matching is verified*/).into();
 
         // the remaining data is for the cert
-        let cert_len = rdata_length
-        .map(|u| u as usize)
-        .checked_sub(3)
-        .map_err(|_| ProtoError::from("invalid rdata length in TLSA"))?
-        .unverified(/*used purely as length safely*/);
-        let cert_data = decoder.read_vec(cert_len)?.unverified(/*will fail in usage if invalid*/);
+        let cert_data = decoder.read_vec_to_end().unverified(/*will fail in usage if invalid*/);
 
         Ok(Self {
             cert_usage,
@@ -389,13 +470,6 @@ impl<'r> RecordDataDecodable<'r> for TLSA {
 }
 
 impl RecordData for TLSA {
-    fn try_from_rdata(data: RData) -> Result<Self, RData> {
-        match data {
-            RData::TLSA(data) => Ok(data),
-            _ => Err(data),
-        }
-    }
-
     fn try_borrow(data: &RData) -> Option<&Self> {
         match data {
             RData::TLSA(data) => Some(data),
@@ -473,26 +547,33 @@ impl fmt::Display for TLSA {
     }
 }
 
+fn to_u8(data: &str) -> Result<u8, ParseError> {
+    data.parse().map_err(ParseError::from)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
+
+    #[cfg(feature = "std")]
+    use std::println;
 
     use super::*;
 
     #[test]
     fn read_cert_usage() {
-        assert_eq!(CertUsage::CA, CertUsage::from(0));
-        assert_eq!(CertUsage::Service, CertUsage::from(1));
-        assert_eq!(CertUsage::TrustAnchor, CertUsage::from(2));
-        assert_eq!(CertUsage::DomainIssued, CertUsage::from(3));
+        assert_eq!(CertUsage::PkixTa, CertUsage::from(0));
+        assert_eq!(CertUsage::PkixEe, CertUsage::from(1));
+        assert_eq!(CertUsage::DaneTa, CertUsage::from(2));
+        assert_eq!(CertUsage::DaneEe, CertUsage::from(3));
         assert_eq!(CertUsage::Unassigned(4), CertUsage::from(4));
         assert_eq!(CertUsage::Unassigned(254), CertUsage::from(254));
         assert_eq!(CertUsage::Private, CertUsage::from(255));
 
-        assert_eq!(u8::from(CertUsage::CA), 0);
-        assert_eq!(u8::from(CertUsage::Service), 1);
-        assert_eq!(u8::from(CertUsage::TrustAnchor), 2);
-        assert_eq!(u8::from(CertUsage::DomainIssued), 3);
+        assert_eq!(u8::from(CertUsage::PkixTa), 0);
+        assert_eq!(u8::from(CertUsage::PkixEe), 1);
+        assert_eq!(u8::from(CertUsage::DaneTa), 2);
+        assert_eq!(u8::from(CertUsage::DaneEe), 3);
         assert_eq!(u8::from(CertUsage::Unassigned(4)), 4);
         assert_eq!(u8::from(CertUsage::Unassigned(254)), 254);
         assert_eq!(u8::from(CertUsage::Private), 255);
@@ -536,30 +617,30 @@ mod tests {
         rdata.emit(&mut encoder).expect("failed to emit tlsa");
         let bytes = encoder.into_bytes();
 
+        #[cfg(feature = "std")]
         println!("bytes: {bytes:?}");
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
-        let read_rdata = TLSA::read_data(&mut decoder, Restrict::new(bytes.len() as u16))
-            .expect("failed to read back");
+        let read_rdata = TLSA::read_data(&mut decoder).expect("failed to read back");
         assert_eq!(rdata, read_rdata);
     }
 
     #[test]
     fn test_encode_decode_tlsa() {
         test_encode_decode(TLSA::new(
-            CertUsage::Service,
+            CertUsage::PkixEe,
             Selector::Spki,
             Matching::Sha256,
             vec![1, 2, 3, 4, 5, 6, 7, 8],
         ));
         test_encode_decode(TLSA::new(
-            CertUsage::CA,
+            CertUsage::PkixTa,
             Selector::Full,
             Matching::Raw,
             vec![1, 2, 3, 4, 5, 6, 7, 8],
         ));
         test_encode_decode(TLSA::new(
-            CertUsage::DomainIssued,
+            CertUsage::DaneEe,
             Selector::Full,
             Matching::Sha512,
             vec![1, 2, 3, 4, 5, 6, 7, 8],
@@ -570,5 +651,37 @@ mod tests {
             Matching::Unassigned(6),
             vec![1, 2, 3, 4, 5, 6, 7, 8],
         ));
+    }
+
+    #[test]
+    fn test_parsing() {
+        assert!(
+            TLSA::from_tokens(
+                vec![
+                    "0",
+                    "0",
+                    "1",
+                    "d2abde240d7cd3ee6b4b28c54df034b9",
+                    "7983a1d16e8a410e4561cb106618e971",
+                ]
+                .into_iter()
+            )
+            .is_ok()
+        );
+        assert!(
+            TLSA::from_tokens(
+                vec![
+                    "1",
+                    "1",
+                    "2",
+                    "92003ba34942dc74152e2f2c408d29ec",
+                    "a5a520e7f2e06bb944f4dca346baf63c",
+                    "1b177615d466f6c4b71c216a50292bd5",
+                    "8c9ebdd2f74e38fe51ffd48c43326cbc",
+                ]
+                .into_iter()
+            )
+            .is_ok()
+        );
     }
 }

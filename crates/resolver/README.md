@@ -1,10 +1,10 @@
 # Overview
 
-Hickory DNS Resolver is a library which implements the DNS resolver using the Hickory DNS Proto library.
+`hickory-resolver` is a safe and secure DNS stub resolver library intended to be a high-level library
+for DNS record resolution.
 
-This library contains implementations for IPv4 (A) and IPv6 (AAAA) resolution, more features are in the works. It is built on top of the [tokio](https://tokio.rs) async-io project, this allows it to be integrated into other systems using the tokio and futures libraries. The Hickory DNS [project](https://github.com/hickory-dns/hickory-dns) contains other libraries for DNS: a [client library](https://crates.io/crates/hickory-client) for raw protocol usage, a [server library](https://crates.io/crates/hickory-server) for hosting zones, and variations on the TLS implementation over [rustls](https://crates.io/crates/hickory-dns-rustls) and [native-tls](https://crates.io/crates/hickory-dns-native-tls).
-
-**NOTICE** This project was rebranded fromt Trust-DNS to Hickory DNS and has been moved to the https://github.com/hickory-dns/hickory-dns organization and repo, this crate/binary has been moved to [hickory-resolver](https://crates.io/crates/hickory-resolver), from `0.24` and onward, for prior versions see [trust-dns-resolver](https://crates.io/crates/trust-dns-resolver).
+It can be configured to use the system resolver configuration and will properly follow CNAME chains
+as well as SRV record lookups.
 
 ## Features
 
@@ -16,74 +16,62 @@ This library contains implementations for IPv4 (A) and IPv6 (AAAA) resolution, m
 - DNSSEC validation
 - Generic Record Type Lookup
 - CNAME chain resolution
-- _experimental_ mDNS support (enable with `mdns` feature)
-- DNS over TLS (utilizing `native-tls`, `rustls`, and `openssl`; `native-tls` or `rustls` are recommended)
-- DNS over HTTPS (currently only supports `rustls`)
 
-## Example
+## Cryptography provider
 
-```rust
-use std::net::*;
-use hickory_resolver::Resolver;
-use hickory_resolver::config::*;
+Features requiring cryptography require selecting a specific cryptography
+provider. See the [project README] for more information.
 
-// Construct a new Resolver with default configuration options
-let mut resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default()).unwrap();
+[project README]: ../../README.md#Cryptography-provider
 
-// On Unix/Posix systems, this will read the /etc/resolv.conf
-// let mut resolver = Resolver::from_system_conf().unwrap();
+## Protocol support
 
-// Lookup the IP addresses associated with a name.
-let mut response = resolver.lookup_ip("www.example.com.").unwrap();
+The following DNS protocols are optionally supported:
 
-// There can be many addresses associated with the name,
-//  this can return IPv4 and/or IPv6 addresses
-let address = response.iter().next().expect("no addresses returned!");
-if address.is_ipv4() {
-    assert_eq!(address, IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)));
-} else {
-    assert_eq!(address, IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c)));
-}
-```
+* DNS over TLS (DoT)
+* DNS over HTTP/2 (DoH)
+* DNS over QUIC (DoQ)
+* DNS over HTTP/3 (DoH3)
 
-## DNS-over-TLS and DNS-over-HTTPS
+In order to use these optional protocols you must enable a cargo feature
+corresponding to your desired cryptography provider:
 
-DoT and DoH are supported. This is accomplished through the use of one of `native-tls`, `openssl`, or `rustls` (only `rustls` is currently supported for DoH). The Resolver requires valid DoT or DoH resolvers being registered in order to be used.
+* DoT: `tls-aws-lc-rs` or `tls-ring`.
+* DoH: `https-aws-lc-rs` or `https-ring`
+* DoQ: `quic-aws-lc-rs` or `quic-ring`
+* DoH3: `h3-aws-lc-rs` or `h3-ring`
 
-To use with the `Client`, the `TlsClientConnection` or `HttpsClientConnection` should be used. Similarly, to use with the tokio `AsyncClient` the `TlsClientStream` or `HttpsClientStream` should be used. ClientAuth, mTLS, is currently not supported, there are some issues still being worked on. TLS is useful for Server authentication and connection privacy.
+## DNSSEC
 
-To enable DoT one of the features `dns-over-native-tls`, `dns-over-openssl`, or `dns-over-rustls` must be enabled, `dns-over-https-rustls` is used for DoH.
+In order to use DNSSEC you must enable a cargo feature corresponding to your
+desired cryptography provider:
 
-### Example
+* `dnssec-aws-lc-rs`
+* `dnssec-ring`
 
-Enable the TLS library through the dependency on `hickory-resolver`:
+The current root key is bundled into the system, and used by default. This gives
+validation of DNSKEY and DS records back to the root. NSEC and NSEC3 are
+implemented.
 
-```toml
-hickory-resolver = { version = "*", features = ["dns-over-rustls"] }
-```
+## Other crate features
 
-A default TLS configuration is available for Cloudflare's `1.1.1.1` DNS service (Quad9 as well):
+* `system-config` (enabled by default) - support using the system recursive resolver configuration.
+* `tokio` (enabled by default) - support for the Tokio async runtime.
+* `serde` - enable serde serialization support.
+* `toml` - enable support for TOML serialization.
+* `rustls-platform-verifier` (enabled by default) - use the system verifier for TLS with
+  [rustls-platform-verifier].
+* `webpki-roots` - use the [webpki-roots] crate for TLS certificate verification.
+* `metrics` - support exposing metrics using the [`metrics`] crate.
 
-```rust
-// Construct a new Resolver with default configuration options
-let mut resolver = Resolver::new(ResolverConfig::cloudflare_tls(), ResolverOpts::default()).unwrap();
+[rustls-platform-verifier]: https://crates.io/crates/rustls-platform-verifier
+[webpki-roots]: https://crates.io/crates/webpki-roots
+[`metrics`]: https://crates.io/crates/metrics
 
-/// see example above...
-```
+## `resolve` command line tool
 
-## DNSSEC status
-
-Currently the root key is hardcoded into the system. This gives validation of
-DNSKEY and DS records back to the root. NSEC is implemented, but not NSEC3.
-Because caching is not yet enabled, it has been noticed that some DNS servers
-appear to rate limit the connections, validating RRSIG records back to the root
-can require a significant number of additional queries for those records.
-
-Zones will be automatically resigned on any record updates via dynamic DNS. To enable DNSSEC, one of the features `dnssec-openssl` or `dnssec-ring` must be enabled.
-
-## Testing the resolver via CLI with resolve
-
-Useful for testing hickory-resolver and it's features via an independent CLI.
+A simple `resolve` command-line utility that uses `hickory-resolver` can be installed
+to test the crate functionality:
 
 ```shell
 cargo install --bin resolve hickory-util
@@ -97,11 +85,3 @@ Querying for www.example.com. A from udp:8.8.8.8:53, tcp:8.8.8.8:53, udp:8.8.4.4
 Success for query name: www.example.com. type: A class: IN
         www.example.com. 21063 IN A 93.184.215.14
 ```
-
-## Minimum Rust Version
-
-The current minimum rustc version for this project is `1.67`
-
-## Versioning
-
-Hickory DNS does its best job to follow semver. Hickory DNS will be promoted to 1.0 upon stabilization of the publicly exposed APIs. This does not mean that Hickory DNS will necessarily break on upgrades between 0.x updates. Whenever possible, old APIs will be deprecated with notes on what replaced those deprecations. Hickory DNS will make a best effort to never break software which depends on it due to API changes, though this can not be guaranteed. Deprecated interfaces will be maintained for at minimum one major release after that in which they were deprecated (where possible), with the exception of the upgrade to 1.0 where all deprecated interfaces will be planned to be removed.

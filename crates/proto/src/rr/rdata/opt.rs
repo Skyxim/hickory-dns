@@ -8,23 +8,27 @@
 //! option record for passing protocol options between the client and server
 #![allow(clippy::use_self)]
 
-use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::str::FromStr;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
+use core::hash::Hash;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use core::str::FromStr;
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-
 use tracing::warn;
 
 use crate::{
-    error::{ProtoError, ProtoErrorKind, ProtoResult},
+    error::{ProtoError, ProtoResult},
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
-    serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder, Restrict},
+    serialize::binary::{
+        BinDecodable, BinDecoder, BinEncodable, BinEncoder, DecodeError, RDataEncoding,
+    },
 };
 
-#[cfg(feature = "dnssec")]
-use crate::rr::dnssec::SupportedAlgorithms;
+#[cfg(feature = "__dnssec")]
+use crate::dnssec::SupportedAlgorithms;
 
 /// The OPT record type is used for ExtendedDNS records.
 ///
@@ -164,10 +168,12 @@ use crate::rr::dnssec::SupportedAlgorithms;
 ///       Set to zero by senders and ignored by receivers, unless modified
 ///       in a subsequent specification.
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
-#[derive(Default, Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+#[derive(Default, Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub struct OPT {
-    options: Vec<(EdnsCode, EdnsOption)>,
+    /// List of code and record type tuples
+    pub options: Vec<(EdnsCode, EdnsOption)>,
 }
 
 impl OPT {
@@ -210,20 +216,6 @@ impl OPT {
     }
 }
 
-impl PartialEq for OPT {
-    fn eq(&self, other: &Self) -> bool {
-        let matching_elements_count = self
-            .options
-            .iter()
-            .filter(|entry| other.options.contains(entry))
-            .count();
-        matching_elements_count == self.options.len()
-            && matching_elements_count == other.options.len()
-    }
-}
-
-impl Eq for OPT {}
-
 impl AsMut<Vec<(EdnsCode, EdnsOption)>> for OPT {
     fn as_mut(&mut self) -> &mut Vec<(EdnsCode, EdnsOption)> {
         &mut self.options
@@ -238,24 +230,23 @@ impl AsRef<[(EdnsCode, EdnsOption)]> for OPT {
 
 impl BinEncodable for OPT {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
+        let mut encoder = encoder.with_rdata_behavior(RDataEncoding::Other);
         for (edns_code, edns_option) in self.as_ref().iter() {
-            encoder.emit_u16(u16::from(*edns_code))?;
-            encoder.emit_u16(edns_option.len())?;
-            edns_option.emit(encoder)?
+            u16::from(*edns_code).emit(&mut encoder)?;
+            edns_option.len().emit(&mut encoder)?;
+            edns_option.emit(&mut encoder)?
         }
         Ok(())
     }
 }
 
 impl<'r> RecordDataDecodable<'r> for OPT {
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let mut state: OptReadState = OptReadState::ReadCode;
         let mut options: Vec<(EdnsCode, EdnsOption)> = Vec::new();
-        let start_idx = decoder.index();
 
-        // There is no unsafe direct use of the rdata length after this point
-        let rdata_length = length.map(|u| u as usize).unverified(/*rdata length usage is bounded*/);
-        while rdata_length > decoder.index() - start_idx {
+        let rdata_length = decoder.len();
+        while !decoder.is_empty() {
             match state {
                 OptReadState::ReadCode => {
                     state = OptReadState::Code {
@@ -269,7 +260,10 @@ impl<'r> RecordDataDecodable<'r> for OPT {
                         .read_u16()?
                         .map(|u| u as usize)
                         .verify_unwrap(|u| *u <= rdata_length)
-                        .map_err(|_| ProtoError::from("OPT value length exceeds rdata length"))?;
+                        .map_err(|opt_len| DecodeError::IncorrectRDataLengthRead {
+                            read: rdata_length,
+                            len: opt_len,
+                        })?;
                     // If we know that the length is 0, we can avoid the `OptReadState::Data` state
                     // and directly add the option to the map.
                     // The data state does not process 0-length correctly, since it always reads at
@@ -321,13 +315,6 @@ impl<'r> RecordDataDecodable<'r> for OPT {
 }
 
 impl RecordData for OPT {
-    fn try_from_rdata(data: RData) -> Result<Self, RData> {
-        match data {
-            RData::OPT(csync) => Ok(csync),
-            _ => Err(data),
-        }
-    }
-
     fn try_borrow(data: &RData) -> Option<&Self> {
         match data {
             RData::OPT(csync) => Some(csync),
@@ -364,14 +351,14 @@ enum OptReadState {
 }
 
 /// The code of the EDNS data option
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
-#[derive(Hash, Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+#[derive(Hash, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum EdnsCode {
     /// [RFC 6891, Reserved](https://tools.ietf.org/html/rfc6891)
     Zero,
 
-    /// [RFC 8764l, Apple's Long-Lived Queries, Optional](https://tools.ietf.org/html/rfc8764)
+    /// [RFC 8764, Apple's Long-Lived Queries, Optional](https://tools.ietf.org/html/rfc8764)
     LLQ,
 
     /// [UL On-hold](https://files.dns-sd.org/draft-sekar-dns-ul.txt)
@@ -407,6 +394,9 @@ pub enum EdnsCode {
     /// [RFC 7901, CHAIN Query Requests in DNS, Optional](https://tools.ietf.org/html/rfc7901)
     Chain,
 
+    /// [RFC 8914, Extended DNS Errors](https://tools.ietf.org/html/rfc8914)
+    ExtendedDnsError,
+
     /// Unknown, used to deal with unknown or unsupported codes
     Unknown(u16),
 }
@@ -429,6 +419,8 @@ impl From<u16> for EdnsCode {
             11 => Self::Keepalive,
             12 => Self::Padding,
             13 => Self::Chain,
+            // 14 Zoneversion [RFC 9660]
+            15 => Self::ExtendedDnsError,
             _ => Self::Unknown(value),
         }
     }
@@ -451,6 +443,7 @@ impl From<EdnsCode> for u16 {
             EdnsCode::Keepalive => 11,
             EdnsCode::Padding => 12,
             EdnsCode::Chain => 13,
+            EdnsCode::ExtendedDnsError => 15,
             EdnsCode::Unknown(value) => value,
         }
     }
@@ -461,27 +454,22 @@ impl From<EdnsCode> for u16 {
 /// `note: Not all EdnsOptions are supported at this time.`
 ///
 /// <https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml#dns-parameters-13>
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
-#[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+#[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Hash, Ord)]
 #[non_exhaustive]
 pub enum EdnsOption {
     /// [RFC 6975, DNSSEC Algorithm Understood](https://tools.ietf.org/html/rfc6975)
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+    #[cfg(feature = "__dnssec")]
     DAU(SupportedAlgorithms),
-
-    /// [RFC 6975, DS Hash Understood](https://tools.ietf.org/html/rfc6975)
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-    DHU(SupportedAlgorithms),
-
-    /// [RFC 6975, NSEC3 Hash Understood](https://tools.ietf.org/html/rfc6975)
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-    N3U(SupportedAlgorithms),
 
     /// [RFC 7871, Client Subnet, Optional](https://tools.ietf.org/html/rfc7871)
     Subnet(ClientSubnet),
+
+    /// [RFC 5001, DNS Name Server Identifier (NSID) Option](https://tools.ietf.org/html/rfc5001)
+    NSID(NSIDPayload),
+
+    /// [RFC 8914, Extended DNS Errors](https://tools.ietf.org/html/rfc8914)
+    ExtendedDnsError(ExtendedDnsError),
 
     /// Unknown, used to deal with unknown or unsupported codes
     Unknown(u16, Vec<u8>),
@@ -490,56 +478,53 @@ pub enum EdnsOption {
 impl EdnsOption {
     /// Returns the length in bytes of the EdnsOption
     pub fn len(&self) -> u16 {
-        match *self {
-            #[cfg(feature = "dnssec")]
-            EdnsOption::DAU(ref algorithms)
-            | EdnsOption::DHU(ref algorithms)
-            | EdnsOption::N3U(ref algorithms) => algorithms.len(),
-            EdnsOption::Subnet(ref subnet) => subnet.len(),
-            EdnsOption::Unknown(_, ref data) => data.len() as u16, // TODO: should we verify?
+        match self {
+            #[cfg(feature = "__dnssec")]
+            EdnsOption::DAU(algorithms) => algorithms.len(),
+            EdnsOption::Subnet(subnet) => subnet.len(),
+            EdnsOption::NSID(payload) => payload.as_ref().len() as u16, // cast safety: NSIDPayload size is constrained.
+            EdnsOption::ExtendedDnsError(ede) => ede.len(),
+            EdnsOption::Unknown(_, data) => data.len() as u16, // TODO: should we verify?
         }
     }
 
     /// Returns `true` if the length in bytes of the EdnsOption is 0
     pub fn is_empty(&self) -> bool {
-        match *self {
-            #[cfg(feature = "dnssec")]
-            EdnsOption::DAU(ref algorithms)
-            | EdnsOption::DHU(ref algorithms)
-            | EdnsOption::N3U(ref algorithms) => algorithms.is_empty(),
-            EdnsOption::Subnet(ref subnet) => subnet.is_empty(),
-            EdnsOption::Unknown(_, ref data) => data.is_empty(),
+        match self {
+            #[cfg(feature = "__dnssec")]
+            EdnsOption::DAU(algorithms) => algorithms.is_empty(),
+            EdnsOption::Subnet(subnet) => subnet.is_empty(),
+            EdnsOption::NSID(payload) => payload.as_ref().is_empty(),
+            EdnsOption::ExtendedDnsError(ede) => ede.is_empty(),
+            EdnsOption::Unknown(_, data) => data.is_empty(),
         }
     }
 }
 
 impl BinEncodable for EdnsOption {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        match *self {
-            #[cfg(feature = "dnssec")]
-            EdnsOption::DAU(ref algorithms)
-            | EdnsOption::DHU(ref algorithms)
-            | EdnsOption::N3U(ref algorithms) => algorithms.emit(encoder),
-            EdnsOption::Subnet(ref subnet) => subnet.emit(encoder),
-            EdnsOption::Unknown(_, ref data) => encoder.emit_vec(data), // gah, clone needed or make a crazy api.
+        match self {
+            #[cfg(feature = "__dnssec")]
+            EdnsOption::DAU(algorithms) => algorithms.emit(encoder),
+            EdnsOption::Subnet(subnet) => subnet.emit(encoder),
+            EdnsOption::NSID(payload) => encoder.emit_slice(payload.as_ref()),
+            EdnsOption::ExtendedDnsError(ede) => ede.emit(encoder),
+            EdnsOption::Unknown(_, data) => encoder.emit_slice(data), // gah, clone needed or make a crazy api.
         }
     }
 }
 
 /// only the supported extensions are listed right now.
 impl<'a> TryFrom<(EdnsCode, &'a [u8])> for EdnsOption {
-    type Error = ProtoError;
+    type Error = DecodeError;
 
-    #[allow(clippy::match_single_binding)]
     fn try_from(value: (EdnsCode, &'a [u8])) -> Result<Self, Self::Error> {
         Ok(match value.0 {
-            #[cfg(feature = "dnssec")]
+            #[cfg(feature = "__dnssec")]
             EdnsCode::DAU => Self::DAU(value.1.into()),
-            #[cfg(feature = "dnssec")]
-            EdnsCode::DHU => Self::DHU(value.1.into()),
-            #[cfg(feature = "dnssec")]
-            EdnsCode::N3U => Self::N3U(value.1.into()),
             EdnsCode::Subnet => Self::Subnet(value.1.try_into()?),
+            EdnsCode::NSID => Self::NSID(value.1.try_into()?),
+            EdnsCode::ExtendedDnsError => Self::ExtendedDnsError(value.1.try_into()?),
             _ => Self::Unknown(value.0.into(), value.1.to_vec()),
         })
     }
@@ -549,28 +534,26 @@ impl<'a> TryFrom<&'a EdnsOption> for Vec<u8> {
     type Error = ProtoError;
 
     fn try_from(value: &'a EdnsOption) -> Result<Self, Self::Error> {
-        Ok(match *value {
-            #[cfg(feature = "dnssec")]
-            EdnsOption::DAU(ref algorithms)
-            | EdnsOption::DHU(ref algorithms)
-            | EdnsOption::N3U(ref algorithms) => algorithms.into(),
-            EdnsOption::Subnet(ref subnet) => subnet.try_into()?,
-            EdnsOption::Unknown(_, ref data) => data.clone(), // gah, clone needed or make a crazy api.
+        Ok(match value {
+            #[cfg(feature = "__dnssec")]
+            EdnsOption::DAU(algorithms) => algorithms.into(),
+            EdnsOption::Subnet(subnet) => subnet.try_into()?,
+            EdnsOption::NSID(payload) => payload.as_ref().to_vec(),
+            EdnsOption::ExtendedDnsError(ede) => ede.try_into()?,
+            EdnsOption::Unknown(_, data) => data.clone(), // gah, clone needed or make a crazy api.
         })
     }
 }
 
 impl<'a> From<&'a EdnsOption> for EdnsCode {
     fn from(value: &'a EdnsOption) -> Self {
-        match *value {
-            #[cfg(feature = "dnssec")]
+        match value {
+            #[cfg(feature = "__dnssec")]
             EdnsOption::DAU(..) => Self::DAU,
-            #[cfg(feature = "dnssec")]
-            EdnsOption::DHU(..) => Self::DHU,
-            #[cfg(feature = "dnssec")]
-            EdnsOption::N3U(..) => Self::N3U,
             EdnsOption::Subnet(..) => Self::Subnet,
-            EdnsOption::Unknown(code, _) => code.into(),
+            EdnsOption::NSID(..) => Self::NSID,
+            EdnsOption::ExtendedDnsError(..) => Self::ExtendedDnsError,
+            EdnsOption::Unknown(code, _) => (*code).into(),
         }
     }
 }
@@ -605,8 +588,8 @@ impl<'a> From<&'a EdnsOption> for EdnsCode {
 ///    as a signal to the software developer making the request to fix
 ///    their implementation.
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
-#[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Copy, Hash)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+#[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Copy, Hash, Ord)]
 pub struct ClientSubnet {
     address: IpAddr,
     source_prefix: u8,
@@ -669,7 +652,12 @@ impl ClientSubnet {
 
     fn addr_len(&self) -> u16 {
         let source_prefix = self.source_prefix as u16;
-        source_prefix / 8 + if source_prefix % 8 > 0 { 1 } else { 0 }
+        source_prefix / 8
+            + if !source_prefix.is_multiple_of(8) {
+                1
+            } else {
+                0
+            }
     }
 }
 
@@ -683,33 +671,27 @@ impl BinEncodable for ClientSubnet {
 
         match address {
             IpAddr::V4(ip) => {
-                encoder.emit_u16(1)?; // FAMILY: IPv4
-                encoder.emit_u8(source_prefix)?;
-                encoder.emit_u8(scope_prefix)?;
+                1u16.emit(encoder)?; // FAMILY: IPv4
+                source_prefix.emit(encoder)?;
+                scope_prefix.emit(encoder)?;
                 let octets = ip.octets();
                 let addr_len = addr_len as usize;
                 if addr_len <= octets.len() {
-                    encoder.emit_vec(&octets[0..addr_len])?
+                    encoder.emit_slice(&octets[0..addr_len])?
                 } else {
-                    return Err(ProtoErrorKind::Message(
-                        "Invalid addr length for encode EcsOption",
-                    )
-                    .into());
+                    return Err(ProtoError::from("Invalid addr length for encode EcsOption"));
                 }
             }
             IpAddr::V6(ip) => {
-                encoder.emit_u16(2)?; // FAMILY: IPv6
-                encoder.emit_u8(source_prefix)?;
-                encoder.emit_u8(scope_prefix)?;
+                2u16.emit(encoder)?; // FAMILY: IPv6
+                source_prefix.emit(encoder)?;
+                scope_prefix.emit(encoder)?;
                 let octets = ip.octets();
                 let addr_len = addr_len as usize;
                 if addr_len <= octets.len() {
-                    encoder.emit_vec(&octets[0..addr_len])?
+                    encoder.emit_slice(&octets[0..addr_len])?
                 } else {
-                    return Err(ProtoErrorKind::Message(
-                        "Invalid addr length for encode EcsOption",
-                    )
-                    .into());
+                    return Err(ProtoError::from("Invalid addr length for encode EcsOption"));
                 }
             }
         }
@@ -718,7 +700,7 @@ impl BinEncodable for ClientSubnet {
 }
 
 impl<'a> BinDecodable<'a> for ClientSubnet {
-    fn read(decoder: &mut BinDecoder<'a>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'a>) -> Result<Self, DecodeError> {
         let family = decoder.read_u16()?.unverified();
 
         match family {
@@ -730,7 +712,10 @@ impl<'a> BinDecodable<'a> for ClientSubnet {
                     (source_prefix / 8 + if source_prefix % 8 > 0 { 1 } else { 0 }) as usize;
                 let mut octets = Ipv4Addr::UNSPECIFIED.octets();
                 if addr_len > octets.len() {
-                    return Err(ProtoErrorKind::Message("Invalid address length").into());
+                    return Err(DecodeError::IncorrectRDataLengthRead {
+                        read: octets.len(),
+                        len: addr_len,
+                    });
                 }
                 for octet in octets.iter_mut().take(addr_len) {
                     *octet = decoder.read_u8()?.unverified();
@@ -749,7 +734,10 @@ impl<'a> BinDecodable<'a> for ClientSubnet {
                     (source_prefix / 8 + if source_prefix % 8 > 0 { 1 } else { 0 }) as usize;
                 let mut octets = Ipv6Addr::UNSPECIFIED.octets();
                 if addr_len > octets.len() {
-                    return Err(ProtoErrorKind::Message("Invalid address length").into());
+                    return Err(DecodeError::IncorrectRDataLengthRead {
+                        read: octets.len(),
+                        len: addr_len,
+                    });
                 }
                 for octet in octets.iter_mut().take(addr_len) {
                     *octet = decoder.read_u8()?.unverified();
@@ -761,7 +749,7 @@ impl<'a> BinDecodable<'a> for ClientSubnet {
                     scope_prefix,
                 })
             }
-            _ => Err(ProtoErrorKind::Message("Invalid family type.").into()),
+            _ => Err(DecodeError::UnknownAddressFamily(family)),
         }
     }
 }
@@ -779,7 +767,7 @@ impl<'a> TryFrom<&'a ClientSubnet> for Vec<u8> {
 }
 
 impl<'a> TryFrom<&'a [u8]> for ClientSubnet {
-    type Error = ProtoError;
+    type Error = DecodeError;
 
     fn try_from(value: &'a [u8]) -> Result<Self, Self::Error> {
         let mut decoder = BinDecoder::new(value);
@@ -805,14 +793,146 @@ impl FromStr for ClientSubnet {
     }
 }
 
+/// A raw binary NSID payload
+///
+/// Constrained to u16::MAX bytes.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+pub struct NSIDPayload(Vec<u8>);
+
+impl NSIDPayload {
+    /// Construct a new NSID payload from the provided binary data
+    ///
+    /// A `ProtoError` is returned if the provided data is too large to be
+    /// expressed as an EDNS option value.
+    pub fn new(data: impl Into<Vec<u8>>) -> Result<Self, ProtoError> {
+        let data = data.into();
+        if data.len() > u16::MAX as usize {
+            return Err(ProtoError::from("NSID EDNS payload too large"));
+        }
+        Ok(Self(data))
+    }
+}
+
+impl<'a> TryFrom<&'a [u8]> for NSIDPayload {
+    type Error = DecodeError;
+
+    fn try_from(value: &'a [u8]) -> Result<Self, Self::Error> {
+        if value.len() > u16::MAX as usize {
+            return Err(DecodeError::IncorrectRDataLengthRead {
+                read: value.len(),
+                len: u16::MAX as usize,
+            });
+        }
+        Ok(Self(value.to_vec()))
+    }
+}
+
+impl AsRef<[u8]> for NSIDPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// [RFC 8914, Extended DNS Errors](https://tools.ietf.org/html/rfc8914)
+///
+/// Carries an extended, machine readable error code plus optional human
+/// readable text, for example to explain why a response failed DNSSEC
+/// validation instead of returning a bare SERVFAIL.
+///
+/// ```text
+///    +0 (MSB)                            +1 (LSB)
+///    +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+/// 0: |                           INFO-CODE                           |
+///    +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+/// 2: /                           EXTRA-TEXT ...                      /
+///    +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+///
+/// o  INFO-CODE, 2 octets, a value from the IANA "Extended DNS Error
+///    Codes" registry.
+/// o  EXTRA-TEXT, a variable length, UTF-8 encoded, human readable string
+///    with additional detail about the error. It may be zero length.
+/// ```
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+#[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Hash, Ord)]
+pub struct ExtendedDnsError {
+    /// The INFO-CODE identifying the extended error, per the IANA registry.
+    pub info_code: u16,
+    /// The UTF-8 EXTRA-TEXT carrying additional detail about the error.
+    ///
+    /// This may be empty when no extra detail is provided.
+    pub extra_text: String,
+}
+
+impl ExtendedDnsError {
+    /// Returns the length in bytes of the option data.
+    fn len(&self) -> u16 {
+        // INFO-CODE (2 octets) + EXTRA-TEXT
+        2u16.saturating_add(u16::try_from(self.extra_text.len()).unwrap_or(u16::MAX))
+    }
+
+    /// Returns `true` if the length in bytes of the option data is 0.
+    ///
+    /// An Extended DNS Error always carries a 2-octet INFO-CODE, so this is
+    /// always `false`.
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl BinEncodable for ExtendedDnsError {
+    fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
+        self.info_code.emit(encoder)?;
+        encoder.emit_slice(self.extra_text.as_bytes())?;
+        Ok(())
+    }
+}
+
+impl<'a> BinDecodable<'a> for ExtendedDnsError {
+    fn read(decoder: &mut BinDecoder<'a>) -> Result<Self, DecodeError> {
+        let info_code = decoder.read_u16()?.unverified();
+        let extra_text = decoder.read_vec_to_end().unverified();
+        let extra_text = String::from_utf8(extra_text)?;
+        Ok(Self {
+            info_code,
+            extra_text,
+        })
+    }
+}
+
+impl<'a> TryFrom<&'a [u8]> for ExtendedDnsError {
+    type Error = DecodeError;
+
+    fn try_from(value: &'a [u8]) -> Result<Self, Self::Error> {
+        let mut decoder = BinDecoder::new(value);
+        Self::read(&mut decoder)
+    }
+}
+
+impl<'a> TryFrom<&'a ExtendedDnsError> for Vec<u8> {
+    type Error = ProtoError;
+
+    fn try_from(value: &'a ExtendedDnsError) -> Result<Self, Self::Error> {
+        let mut bytes = Self::with_capacity(value.len() as usize);
+        let mut encoder = BinEncoder::new(&mut bytes);
+        value.emit(&mut encoder)?;
+        bytes.shrink_to_fit();
+        Ok(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
+    use core::hash::{Hash, Hasher};
+    #[cfg(feature = "std")]
+    use std::{hash::DefaultHasher, println};
+
     use super::*;
 
     #[test]
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "__dnssec")]
     fn test() {
         let mut rdata = OPT::default();
         rdata.insert(EdnsOption::DAU(SupportedAlgorithms::all()));
@@ -822,11 +942,11 @@ mod tests {
         assert!(rdata.emit(&mut encoder).is_ok());
         let bytes = encoder.into_bytes();
 
+        #[cfg(feature = "std")]
         println!("bytes: {bytes:?}");
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
-        let restrict = Restrict::new(bytes.len() as u16);
-        let read_rdata = OPT::read_data(&mut decoder, restrict).expect("Decoding error");
+        let read_rdata = OPT::read_data(&mut decoder).expect("Decoding error");
         assert_eq!(rdata, read_rdata);
     }
 
@@ -838,7 +958,7 @@ mod tests {
         ];
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(&bytes);
-        let read_rdata = OPT::read_data(&mut decoder, Restrict::new(bytes.len() as u16));
+        let read_rdata = OPT::read_data(&mut decoder);
         assert!(
             read_rdata.is_ok(),
             "error decoding: {:?}",
@@ -848,12 +968,12 @@ mod tests {
         let opt = read_rdata.unwrap();
         let options = vec![
             (
-                EdnsCode::Subnet,
-                EdnsOption::Subnet("0.0.0.0/0".parse().unwrap()),
-            ),
-            (
                 EdnsCode::Cookie,
                 EdnsOption::Unknown(10, vec![0x0b, 0x64, 0xb4, 0xdc, 0xd7, 0xb0, 0xcc, 0x8f]),
+            ),
+            (
+                EdnsCode::Subnet,
+                EdnsOption::Subnet("0.0.0.0/0".parse().unwrap()),
             ),
             (EdnsCode::Keepalive, EdnsOption::Unknown(11, vec![])),
         ];
@@ -869,7 +989,7 @@ mod tests {
         ];
 
         let mut decoder: BinDecoder<'_> = BinDecoder::new(&bytes);
-        let read_rdata = OPT::read_data(&mut decoder, Restrict::new(bytes.len() as u16));
+        let read_rdata = OPT::read_data(&mut decoder);
         assert!(
             read_rdata.is_ok(),
             "error decoding: {:?}",
@@ -878,6 +998,131 @@ mod tests {
 
         let opt = read_rdata.unwrap();
         let options = vec![
+            (
+                EdnsCode::ExtendedDnsError,
+                EdnsOption::ExtendedDnsError(ExtendedDnsError {
+                    info_code: 6,
+                    extra_text: String::new(),
+                }),
+            ),
+            (
+                EdnsCode::ExtendedDnsError,
+                EdnsOption::ExtendedDnsError(ExtendedDnsError {
+                    info_code: 9,
+                    extra_text: String::from("Unknown error"),
+                }),
+            ),
+        ];
+        let options = OPT::new(options);
+        assert_eq!(opt, options);
+    }
+
+    #[test]
+    fn test_extended_dns_error_roundtrip() {
+        let option_in = EdnsOption::ExtendedDnsError(ExtendedDnsError {
+            info_code: 9,
+            extra_text: String::from("Unknown error"),
+        });
+        let mut buf = Vec::new();
+        let mut encoder = BinEncoder::new(&mut buf);
+        option_in.emit(&mut encoder).unwrap();
+
+        // INFO-CODE 9 followed by the UTF-8 EXTRA-TEXT.
+        assert_eq!(&buf[..2], &[0x00, 0x09]);
+
+        let option_out = EdnsOption::try_from((EdnsCode::ExtendedDnsError, buf.as_ref())).unwrap();
+        assert_eq!(option_in, option_out);
+
+        if let EdnsOption::ExtendedDnsError(ede) = option_out {
+            assert_eq!(ede.info_code, 9);
+            assert_eq!(ede.extra_text, "Unknown error");
+        } else {
+            panic!("expected an ExtendedDnsError option");
+        }
+    }
+
+    #[test]
+    fn test_extended_dns_error_no_extra_text() {
+        let ede = ExtendedDnsError {
+            info_code: 6,
+            extra_text: String::new(),
+        };
+        assert_eq!(ede.len(), 2);
+        assert!(ede.extra_text.is_empty());
+
+        let bytes = Vec::<u8>::try_from(&ede).unwrap();
+        assert_eq!(bytes, vec![0x00, 0x06]);
+        assert_eq!(ExtendedDnsError::try_from(bytes.as_slice()).unwrap(), ede);
+    }
+
+    #[test]
+    fn test_extended_dns_error_via_opt() {
+        let mut rdata = OPT::default();
+        rdata.insert(EdnsOption::ExtendedDnsError(ExtendedDnsError {
+            info_code: 18,
+            extra_text: String::from("Prohibited"),
+        }));
+
+        let mut bytes = Vec::new();
+        let mut encoder = BinEncoder::new(&mut bytes);
+        rdata.emit(&mut encoder).unwrap();
+        let bytes = encoder.into_bytes();
+
+        let mut decoder = BinDecoder::new(bytes);
+        let read_rdata = OPT::read_data(&mut decoder).expect("Decoding error");
+        assert_eq!(rdata, read_rdata);
+    }
+
+    #[test]
+    fn test_extended_dns_error_truncated() {
+        // A single byte cannot hold the 2-octet INFO-CODE.
+        let err = ExtendedDnsError::try_from([0x00].as_slice()).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::InsufficientBytes),
+            "expected InsufficientBytes, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_write_client_subnet() {
+        let expected_bytes: Vec<u8> = vec![0x00, 0x01, 0x18, 0x00, 0xac, 0x01, 0x01];
+        let ecs: ClientSubnet = "172.1.1.1/24".parse().unwrap();
+        let bytes = Vec::<u8>::try_from(&ecs).unwrap();
+        #[cfg(feature = "std")]
+        println!("bytes: {bytes:?}");
+        assert_eq!(bytes, expected_bytes);
+    }
+
+    #[test]
+    fn test_read_client_subnet() {
+        let bytes: Vec<u8> = vec![0x00, 0x01, 0x18, 0x00, 0xac, 0x01, 0x01];
+        let ecs = ClientSubnet::try_from(bytes.as_slice()).unwrap();
+        assert_eq!(ecs, "172.1.1.0/24".parse().unwrap());
+    }
+
+    #[test]
+    fn test_nsid_payload_too_large() {
+        let err = NSIDPayload::try_from([0x00; (u16::MAX as usize) + 1].as_slice()).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::IncorrectRDataLengthRead { .. }),
+            "expected IncorrectRDataLengthRead, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_nsid_payload_roundtrip() {
+        let payload_in = EdnsOption::NSID([0xC0, 0xFF, 0xEE].as_slice().try_into().unwrap());
+        let mut buf = Vec::new();
+        let mut encoder = BinEncoder::new(&mut buf);
+        payload_in.emit(&mut encoder).unwrap();
+
+        let payload_out = EdnsOption::try_from((EdnsCode::NSID, buf.as_ref())).unwrap();
+        assert_eq!(payload_in, payload_out);
+    }
+
+    #[test]
+    fn test_eq_and_hash() {
+        let options_1 = OPT::new(vec![
             (
                 EdnsCode::Unknown(15u16),
                 EdnsOption::Unknown(15u16, vec![0x00, 0x06]),
@@ -892,24 +1137,59 @@ mod tests {
                     ],
                 ),
             ),
-        ];
-        let options = OPT::new(options);
-        assert_eq!(opt, options);
-    }
+        ]);
 
-    #[test]
-    fn test_write_client_subnet() {
-        let expected_bytes: Vec<u8> = vec![0x00, 0x01, 0x18, 0x00, 0xac, 0x01, 0x01];
-        let ecs: ClientSubnet = "172.1.1.1/24".parse().unwrap();
-        let bytes = Vec::<u8>::try_from(&ecs).unwrap();
-        println!("bytes: {bytes:?}");
-        assert_eq!(bytes, expected_bytes);
-    }
+        let options_2 = OPT::new(vec![
+            (
+                EdnsCode::Unknown(15u16),
+                EdnsOption::Unknown(
+                    15u16,
+                    vec![
+                        0x00, 0x09, 0x55, 0x6E, 0x6B, 0x6E, 0x6F, 0x77, 0x6E, 0x20, 0x65, 0x72,
+                        0x72, 0x6F, 0x72,
+                    ],
+                ),
+            ),
+            (
+                EdnsCode::Unknown(15u16),
+                EdnsOption::Unknown(15u16, vec![0x00, 0x06]),
+            ),
+        ]);
 
-    #[test]
-    fn test_read_client_subnet() {
-        let bytes: Vec<u8> = vec![0x00, 0x01, 0x18, 0x00, 0xac, 0x01, 0x01];
-        let ecs = ClientSubnet::try_from(bytes.as_slice()).unwrap();
-        assert_eq!(ecs, "172.1.1.0/24".parse().unwrap());
+        // Leading byte changed in the vec
+        let options_3 = OPT::new(vec![
+            (
+                EdnsCode::Unknown(15u16),
+                EdnsOption::Unknown(
+                    15u16,
+                    vec![
+                        0xff, 0x09, 0x55, 0x6E, 0x6B, 0x6E, 0x6F, 0x77, 0x6E, 0x20, 0x65, 0x72,
+                        0x72, 0x6F, 0x72,
+                    ],
+                ),
+            ),
+            (
+                EdnsCode::Unknown(15u16),
+                EdnsOption::Unknown(15u16, vec![0x00, 0x06]),
+            ),
+        ]);
+
+        let mut hasher_1 = DefaultHasher::new();
+        options_1.hash(&mut hasher_1);
+        let hash_1 = hasher_1.finish();
+
+        let mut hasher_2 = DefaultHasher::new();
+        options_2.hash(&mut hasher_2);
+        let hash_2 = hasher_2.finish();
+
+        let mut hasher_3 = DefaultHasher::new();
+        options_3.hash(&mut hasher_3);
+        let hash_3 = hasher_3.finish();
+
+        assert_ne!(options_1, options_2);
+        assert_ne!(hash_1, hash_2);
+
+        assert_ne!(options_1, options_3);
+        assert_ne!(hash_1, hash_3);
     }
 }

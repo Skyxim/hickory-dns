@@ -1,13 +1,37 @@
 # Overview
 
-Hickory DNS Proto is the foundational DNS protocol library and implementation for Hickory DNS. Unless you want to manipulate the DNS packets directly, it is likely not the library you want. Please see Hickory DNS [Resolver](https://crates.io/crates/hickory-resolver), [Client](https://crates.io/crates/hickory-client), or [Server](https://crates.io/crates/hickory-server) for higher level interfaces.
+`hickory-proto` is a safe and secure low-level DNS library.
+This is the foundational DNS protocol library used by the other higher-level Hickory DNS crates.
 
-**NOTICE** This project was rebranded from Trust-DNS to Hickory DNS and has been moved to the https://github.com/hickory-dns/hickory-dns organization and repo, this crate/binary has been moved to [hickory-proto](https://crates.io/crates/hickory-proto), from `0.24` and onward, for prior versions see [trust-dns-proto](https://crates.io/crates/trust-dns-proto).
+Unless you want to manipulate the DNS packets directly, it is likely not the library you want.
+For higher-level interfaces, refer to the [`hickory-server`], [`hickory-resolver`] library crates
+instead.
 
-## Minimum Rust Version
+[`hickory-net`]: ../net
+[`hickory-server`]: ../server
+[`hickory-resolver`]: ../resolver
 
-The current minimum rustc version for this project is `1.67`
+## Cryptography provider
 
-## Versioning
+Features requiring cryptography require selecting a specific cryptography
+provider. See the [project README] for more information.
 
-Hickory DNS does it's best job to follow semver. Hickory DNS will be promoted to 1.0 upon stabilization of the publicly exposed APIs. This does not mean that Hickory DNS will necessarily break on upgrades between 0.x updates. Whenever possible, old APIs will be deprecated with notes on what replaced those deprecations. Hickory DNS will make a best effort to never break software which depends on it due to API changes, though this can not be guaranteed. Deprecated interfaces will be maintained for at minimum one major release after that in which they were deprecated (where possible), with the exception of the upgrade to 1.0 where all deprecated interfaces will be planned to be removed.
+[project README]: ../../README.md#Cryptography-provider
+
+## DNSSEC
+
+In order to use DNSSEC you must enable a cargo feature corresponding to your
+desired cryptography provider:
+
+* `dnssec-aws-lc-rs`
+* `dnssec-ring`
+
+## Other crate features
+
+* `text-parsing` - support for reading text-based zone files.
+* `serde` - enable serde serialization support.
+* `std` - disable for no-std support.
+* `no-std-rand` - enables a custom random function backed by a no_std compatible mutex.
+* `mdns` (experimental) - enable experimental mDNS support.
+* `wasm-bindgen` - support for WASM.
+* `access-control` - enable data structures useful for blocklists and access control.

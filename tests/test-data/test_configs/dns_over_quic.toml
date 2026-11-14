@@ -1,8 +1,10 @@
 listen_addrs_ipv4 = ["0.0.0.0"]
 
-tls_cert = { path = "sec/example.cert.pem", endpoint_name = "ns.example.com", cert_type = "pem", private_key = "sec/example.key" }
+[tls_cert]
+path = "tls/example.pem"
+private_key = "tls/example.key"
+endpoint_name = "ns.example.com"
 
 [[zones]]
 zone = "example.com"
-zone_type = "Primary"
 file = "example.com.zone"

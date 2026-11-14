@@ -8,28 +8,27 @@ Most of the project is in the form of crates. The crates are all individually pu
 
 The project has these high-level crates (to be used as dependencies in other projects):
 
-- **[hickory-resolver](crates/resolver)** - implements a stub-resolver with support for CNAME chasing and other things, abstract over runtimes (Tokio supported by default)
-- **[async-std-resolver](crates/async-std-resolver)** - an abstraction of hickory-resolver using the async-std runtime
-- **[hickory-client](crates/client)** - a bare-bones client crate, most useful for dynamic DNS updates
-- **[hickory-server](crates/server)** - implements support for hosted Authorities of various types
-- **tokio-resolver** - (under consideration, currently Tokio support is directly in hickory-resolver)
+- **[hickory-resolver](crates/resolver)** - implements a stub resolver and recursive resolver (with the latter behind a feature)
+- **[hickory-server](crates/server)** - implements support for various types of hosted zones
 
 Low-level crates supporting the above high-level crates:
 
 - **[hickory-proto](crates/proto)** - the lowest level crate, implements the basics of DNS
+- **[hickory-net](crates/net)** - implements transport protocols, DNS clients, and DNSSEC
 
 Binaries:
 
-- **[hickory-dns](bin/)** - server binary, `hickory-dns`, for hosting authorities, zones, and/or setting up a forwarder
+- **[hickory-dns](bin/)** - server binary, `hickory-dns`, for hosting zones and/or setting up a forwarder or resolver
 - **[hickory-util](util/)** - helpful utilities, e.g. `resolve` for a CLI resolver, as well as some DNSSEC utilities
 
 Old and Outdated crates:
 
-- **[trust-dns-*](https://github.com/bluejekyll/trust-dns/tree/v0.23.1/)** - removed in favor of features in hickory-proto, crate in [v0.24.0](https://github.com/hickory-dns/hickory-dns/tree/v0.24.0)
-- **[trust-dns-rustls](https://github.com/bluejekyll/trust-dns/tree/v0.21.0/crates/rustls)** - removed in favor of features in hickory-proto, crate in [v0.21.0](https://github.com/hickory-dns/hickory-dns/tree/v0.21.0)
-- **[trust-dns-openssl](https://github.com/bluejekyll/trust-dns/tree/v0.21.0/crates/openssl)** - removed in favor of features in hickory-proto, crate in [v0.21.0](https://github.com/hickory-dns/trust-dns/tree/v0.21.0)
-- **[trust-dns-native-tls](https://github.com/bluejekyll/trust-dns/tree/v0.21.0/crates/native-tls)** - removed in favor of features in hickory-proto, crate in [v0.21.0](https://github.com/hickory-dns/trust-dns/tree/v0.21.0)
-- **[trust-dns-https](https://github.com/bluejekyll/trust-dns/tree/v0.21.0/crates/https)** - removed in favor of features in hickory-proto, crate in [v0.21.0](https://github.com/hickory-dns/trust-dns/tree/v0.21.0)
+- **[async-std-resolver](crates/async-std-resolver)** - removed in favor of features in hickory-resolver in [v0.25.0](https://github.com/hickory-dns/hickory-dns/tree/v0.25.0)
+- **[trust-dns-*](https://github.com/hickory-dns/hickory-dns/tree/v0.23.1/)** - renamed to hickory-* in [v0.24.0](https://github.com/hickory-dns/hickory-dns/tree/v0.24.0)
+- **[trust-dns-rustls](https://github.com/hickory-dns/hickory-dns/tree/v0.21.0/crates/rustls)** - removed in favor of features in hickory-proto crate in [v0.21.0](https://github.com/hickory-dns/hickory-dns/tree/v0.21.0)
+- **[trust-dns-openssl](https://github.com/hickory-dns/hickory-dns/tree/v0.21.0/crates/openssl)** - removed in favor of features in hickory-proto crate in [v0.21.0](https://github.com/hickory-dns/hickory-dns/tree/v0.21.0)
+- **[trust-dns-native-tls](https://github.com/hickory-dns/hickory-dns/tree/v0.21.0/crates/native-tls)** - removed in favor of features in hickory-proto crate in [v0.21.0](https://github.com/hickory-dns/hickory-dns/tree/v0.21.0)
+- **[trust-dns-https](https://github.com/hickory-dns/hickory-dns/tree/v0.21.0/crates/https)** - removed in favor of features in hickory-proto crate in [v0.21.0](https://github.com/hickory-dns/hickory-dns/tree/v0.21.0)
 
 ## TBD
 

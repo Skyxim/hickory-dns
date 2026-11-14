@@ -13,10 +13,11 @@ use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::types::ToSql;
 use rusqlite::{self, Connection};
+use thiserror::Error;
 use time;
 use tracing::error;
 
-use crate::error::{PersistenceErrorKind, PersistenceResult};
+use crate::proto::ProtoError;
 use crate::proto::rr::Record;
 use crate::proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
 
@@ -31,7 +32,7 @@ pub struct Journal {
 
 impl Journal {
     /// Constructs a new Journal, attaching to the specified Sqlite Connection
-    pub fn new(conn: Connection) -> PersistenceResult<Self> {
+    pub fn new(conn: Connection) -> Result<Self, PersistenceError> {
         let version = Self::select_schema_version(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -40,7 +41,7 @@ impl Journal {
     }
 
     /// Constructs a new Journal opening a Sqlite connection to the file at the specified path
-    pub fn from_file(journal_file: &Path) -> PersistenceResult<Self> {
+    pub fn from_file(journal_file: &Path) -> Result<Self, PersistenceError> {
         let result = Self::new(Connection::open(journal_file)?);
         let mut journal = result?;
         journal.schema_up()?;
@@ -57,21 +58,20 @@ impl Journal {
         self.version
     }
 
-    /// this returns an iterator from the beginning of time, to be used to recreate an authority
+    /// this returns an iterator from the beginning of time, to be used to recreate a zone handler
     pub fn iter(&self) -> JournalIter<'_> {
         JournalIter::new(self)
     }
 
     /// Inserts a record, this is an append only operation.
     ///
-    /// Records should never be posthumously modified. The message will be serialized into the.
-    ///  the first message serialized to the journal, should be a single AXFR of the entire zone,
-    ///  this will be used as a starting point to reconstruct the zone.
+    /// Records should never be posthumously modified. The first message serialized to the journal
+    /// should be a single AXFR of the entire zone to be used as a starting point for reconstruction.
     ///
     /// # Argument
     ///
     /// * `record` - will be serialized into the journal
-    pub fn insert_record(&self, soa_serial: u32, record: &Record) -> PersistenceResult<()> {
+    pub fn insert_record(&self, soa_serial: u32, record: &Record) -> Result<(), PersistenceError> {
         assert!(
             self.version == CURRENT_VERSION,
             "schema version mismatch, schema_up() resolves this"
@@ -103,18 +103,21 @@ impl Journal {
         )?;
         //
         if count != 1 {
-            return Err(PersistenceErrorKind::WrongInsertCount {
+            return Err(PersistenceError::WrongInsertCount {
                 got: count,
                 expect: 1,
-            }
-            .into());
+            });
         };
 
         Ok(())
     }
 
     /// Inserts a set of records into the Journal, a convenience method for insert_record
-    pub fn insert_records(&self, soa_serial: u32, records: &[Record]) -> PersistenceResult<()> {
+    pub fn insert_records(
+        &self,
+        soa_serial: u32,
+        records: &[Record],
+    ) -> Result<(), PersistenceError> {
         // TODO: NEED TRANSACTION HERE
         for record in records {
             self.insert_record(soa_serial, record)?;
@@ -131,8 +134,8 @@ impl Journal {
     /// # Arguments
     ///
     /// * `row_id` - the row_id can either be exact, or start at 0 to get the earliest row in the
-    ///              list.
-    pub fn select_record(&self, row_id: i64) -> PersistenceResult<Option<(i64, Record)>> {
+    ///   list.
+    pub fn select_record(&self, row_id: i64) -> Result<Option<(i64, Record)>, PersistenceError> {
         assert!(
             self.version == CURRENT_VERSION,
             "schema version mismatch, schema_up() resolves this"
@@ -179,7 +182,7 @@ impl Journal {
     /// # Arguments
     ///
     /// * `conn` - db connection to use
-    pub fn select_schema_version(conn: &Connection) -> PersistenceResult<i64> {
+    pub fn select_schema_version(conn: &Connection) -> Result<i64, PersistenceError> {
         // first see if our schema is there
         let mut stmt = conn.prepare(
             "SELECT name
@@ -214,7 +217,7 @@ impl Journal {
     }
 
     /// update the schema version
-    fn update_schema_version(&self, new_version: i64) -> PersistenceResult<()> {
+    fn update_schema_version(&self, new_version: i64) -> Result<(), PersistenceError> {
         // validate the versions of all the schemas...
         assert!(new_version <= CURRENT_VERSION);
 
@@ -230,7 +233,7 @@ impl Journal {
     }
 
     /// initializes the schema for the Journal
-    pub fn schema_up(&mut self) -> PersistenceResult<i64> {
+    pub fn schema_up(&mut self) -> Result<i64, PersistenceError> {
         while self.version < CURRENT_VERSION {
             match self.version + 1 {
                 0 => self.version = self.init_up()?,
@@ -245,7 +248,7 @@ impl Journal {
     }
 
     /// initial schema, include the tdns_schema table for tracking the Journal version
-    fn init_up(&self) -> PersistenceResult<i64> {
+    fn init_up(&self) -> Result<i64, PersistenceError> {
         let count = self.conn.lock().expect("conn poisoned").execute(
             "CREATE TABLE tdns_schema (
                                           \
@@ -268,9 +271,9 @@ impl Journal {
         Ok(0)
     }
 
-    /// adds the records table, this is the main and single table for the history of changes to an
-    ///  authority. Each record is expected to be in the format of an update record
-    fn records_up(&self) -> PersistenceResult<i64> {
+    /// adds the records table, this is the main and single table for the history of changes to a
+    ///  zone. Each record is expected to be in the format of an update record
+    fn records_up(&self) -> Result<i64, PersistenceError> {
         // we'll be using rowid for our primary key, basically: `rowid INTEGER PRIMARY KEY ASC`
         let count = self.conn.lock().expect("conn poisoned").execute(
             "CREATE TABLE records (
@@ -310,23 +313,52 @@ impl<'j> JournalIter<'j> {
     }
 }
 
-impl<'j> Iterator for JournalIter<'j> {
+impl Iterator for JournalIter<'_> {
     type Item = Record;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next: PersistenceResult<Option<(i64, Record)>> =
-            self.journal.select_record(self.current_row_id + 1);
-
-        match next {
+        match self.journal.select_record(self.current_row_id + 1) {
             Ok(Some((row_id, record))) => {
                 self.current_row_id = row_id;
                 Some(record)
             }
             Ok(None) => None,
-            Err(err) => {
-                error!("persistence error while iterating over journal: {}", err);
+            Err(error) => {
+                error!(%error, "persistence error while iterating over journal");
                 None
             }
         }
     }
+}
+
+/// The error kind for errors that get returned in the crate
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum PersistenceError {
+    /// An error that occurred when recovering from journal
+    #[error("error recovering from journal: {}", _0)]
+    Recovery(&'static str),
+
+    /// The number of inserted records didn't match the expected amount
+    #[error("wrong insert count: {} expect: {}", got, expect)]
+    WrongInsertCount {
+        /// The number of inserted records
+        got: usize,
+        /// The number of records expected to be inserted
+        expect: usize,
+    },
+
+    // foreign
+    /// An error got returned by the hickory-proto crate
+    #[error("proto error: {0}")]
+    Proto(#[from] ProtoError),
+
+    /// An error got returned from the sqlite crate
+    #[cfg(feature = "sqlite")]
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
+    /// A request timed out
+    #[error("request timed out")]
+    Timeout,
 }

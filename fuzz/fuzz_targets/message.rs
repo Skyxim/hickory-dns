@@ -1,34 +1,40 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
+use pretty_assertions::assert_eq;
 
 use hickory_proto::{
+    ProtoError,
     op::Message,
-    rr::{Record, RecordType},
+    rr::Record,
     serialize::binary::{BinDecodable, BinEncodable},
 };
 
 fuzz_target!(|data: &[u8]| {
-    if let Ok(original) = Message::from_bytes(data) {
-        let reencoded = original.to_bytes().unwrap();
-        match Message::from_bytes(&reencoded) {
-            Ok(reparsed) => {
-                if !messages_equal(&original, &reparsed) {
-                    for (m, r) in format!("{:#?}", original)
-                        .lines()
-                        .zip(format!("{:#?}", reparsed).lines())
-                    {
-                        if m != r {
-                            println!("{} -> {}", m, r);
-                        }
-                    }
-                    assert_eq!(original, reparsed);
-                }
-            }
-            Err(e) => {
-                eprintln!("{:?}", original);
-                panic!("Message failed to deserialize: {:?}", e);
-            }
+    let Ok(original) = Message::from_bytes(data) else {
+        // If we can't parse the original message, we can't re-encode it.
+        return;
+    };
+
+    let reencoded = match original.to_bytes() {
+        Ok(reencoded) => reencoded,
+        // If we can't re-encode the original message, we can't re-parse it.
+        Err(ProtoError::NotAllRecordsWritten { .. }) => return,
+        Err(err) => {
+            eprintln!("{original:?}");
+            panic!("Message failed to serialize: {err:?}");
         }
+    };
+
+    let reparsed = match Message::from_bytes(&reencoded) {
+        Ok(reparsed) => reparsed,
+        Err(e) => {
+            eprintln!("{original:?}");
+            panic!("Message failed to deserialize: {e:?}");
+        }
+    };
+
+    if !messages_equal(&original, &reparsed) {
+        assert_eq!(original, reparsed);
     }
 });
 
@@ -38,29 +44,29 @@ fn messages_equal(original: &Message, reparsed: &Message) -> bool {
     }
 
     // see if there are some of the records that don't round trip properly...
-    if reparsed.truncated() {
+    if reparsed.metadata.truncation {
         // TODO: there might be a better comparison to make here.
         return true;
     }
 
     // compare headers
-    if original.header() != reparsed.header() {
+    if original.metadata != reparsed.metadata {
         return false;
     }
 
     // compare queries
-    if original.queries() != reparsed.queries() {
+    if original.queries != reparsed.queries {
         return false;
     }
 
     // now compare answers
-    if !records_equal(original.answers(), reparsed.answers()) {
+    if !records_equal(&original.answers, &reparsed.answers) {
         return false;
     }
-    if !records_equal(original.name_servers(), reparsed.name_servers()) {
+    if !records_equal(&original.authorities, &reparsed.authorities) {
         return false;
     }
-    if !records_equal(original.additionals(), reparsed.additionals()) {
+    if !records_equal(&original.additionals, &reparsed.additionals) {
         return false;
     }
 
@@ -87,20 +93,13 @@ fn record_equal(record1: &Record, record2: &Record) -> bool {
         return false;
     }
 
-    // FIXME: evaluate why these don't work
-    // record types we're skipping for now
-    match record1.record_type() {
-        RecordType::CSYNC => return true,
-        _ => (),
-    }
-
     // if the record data matches, we're fine
-    if record1.data() == record2.data() {
+    if record1.data == record2.data {
         return true;
     }
 
     // custom rules to match..
-    match (record1.data(), record2.data()) {
+    match (&record1.data, &record2.data) {
         (RData::Update0(_), RData::OPT(opt)) | (RData::OPT(opt), RData::Update0(_)) => {
             if opt.as_ref().is_empty() {
                 return true;

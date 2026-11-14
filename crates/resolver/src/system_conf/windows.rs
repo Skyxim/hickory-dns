@@ -7,69 +7,58 @@
 
 //! System configuration loading for windows
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
 
-use ipconfig::computer::{get_domain, get_search_list, is_round_robin_enabled};
+use ipconfig::computer::{get_domain, get_search_list};
 use ipconfig::get_adapters;
 
-use proto::rr::Name;
+use super::sanitize::parse_search_domains;
+use crate::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use crate::proto::ProtoError;
+use crate::proto::rr::Name;
 
-use crate::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
-use crate::error::ResolveResult;
+pub fn read_system_conf() -> Result<(ResolverConfig, ResolverOpts), ProtoError> {
+    let adapters = get_adapters().map_err(|e| format!("ipconfig::get_adapters() failed: {e}"))?;
 
-/// Returns the name servers of the computer (of all adapters)
-fn get_name_servers() -> ResolveResult<Vec<NameServerConfig>> {
-    let adapters = get_adapters()?;
+    let servers = adapters
+        .iter()
+        // Only take interfaces whose OperStatus is Up
+        .filter(|adapter| adapter.oper_status() == ipconfig::OperStatus::IfOperStatusUp)
+        .flat_map(|adapter| adapter.dns_servers());
+
     let mut name_servers = vec![];
+    for &ip in servers {
+        if let IpAddr::V6(ip) = ip {
+            if FORBIDDEN_ADDRS.contains(&ip) {
+                continue;
+            }
+        }
 
-    for dns_server in adapters
-        .iter()
-        .flat_map(|adapter| adapter.dns_servers().iter())
-    {
-        let socket_addr = SocketAddr::new(*dns_server, 53);
-        name_servers.push(NameServerConfig {
-            socket_addr,
-            protocol: Protocol::Udp,
-            tls_dns_name: None,
-            trust_negative_responses: false,
-            #[cfg(feature = "dns-over-rustls")]
-            tls_config: None,
-            bind_addr: None,
-        });
-        name_servers.push(NameServerConfig {
-            socket_addr,
-            protocol: Protocol::Tcp,
-            tls_dns_name: None,
-            trust_negative_responses: false,
-            #[cfg(feature = "dns-over-rustls")]
-            tls_config: None,
-            bind_addr: None,
-        });
+        name_servers.push(NameServerConfig::udp_and_tcp(ip));
     }
-    Ok(name_servers)
-}
 
-pub fn read_system_conf() -> ResolveResult<(ResolverConfig, ResolverOpts)> {
-    let name_servers = get_name_servers()?;
-
-    let search_list: Vec<Name> = get_search_list()?
+    let search_list = get_search_list()
+        .map_err(|e| format!("ipconfig::get_search_list() failed: {e}"))?
         .iter()
-        .map(|x| Name::from_str(x))
+        .flat_map(|x| parse_search_domains(x))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let domain = match get_domain()? {
+    let domain = match get_domain().map_err(|e| format!("ipconfig::get_domain() failed: {e}"))? {
         Some(domain) => Name::from_str(&domain)?,
         None => Name::root(),
     };
 
-    let config = ResolverConfig::from_parts(Some(domain), search_list, name_servers);
-
-    let rotate = is_round_robin_enabled()?;
-
-    let opts = ResolverOpts {
-        rotate,
-        ..Default::default()
-    };
-    Ok((config, opts))
+    Ok((
+        ResolverConfig::from_parts(Some(domain), search_list, name_servers),
+        ResolverOpts::default(),
+    ))
 }
+
+// https://datatracker.ietf.org/doc/html/draft-ietf-ipv6-dns-discovery-07
+// [RFC 3879](https://datatracker.ietf.org/doc/html/rfc3879)
+const FORBIDDEN_ADDRS: [Ipv6Addr; 3] = [
+    Ipv6Addr::new(0xfec0, 0, 0, 0xffff, 0, 0, 0, 1), // fec0:0:0:ffff::1
+    Ipv6Addr::new(0xfec0, 0, 0, 0xffff, 0, 0, 0, 2), // fec0:0:0:ffff::2
+    Ipv6Addr::new(0xfec0, 0, 0, 0xffff, 0, 0, 0, 3), // fec0:0:0:ffff::3
+];

@@ -1,51 +1,26 @@
-#![recursion_limit = "128"]
+use hickory_resolver::{Resolver, net::runtime::TokioRuntimeProvider, proto::rr::RData};
 
-fn main() {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            tokio_main().await;
-        });
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+    tokio_main().await;
 }
 
 async fn tokio_main() {
-    use hickory_resolver::{name_server::TokioConnectionProvider, TokioAsyncResolver};
-
-    let resolver = {
-        // To make this independent, if targeting macOS, BSD, Linux, or Windows, we can use the system's configuration:
-        #[cfg(any(unix, windows))]
-        {
-            // use the system resolver configuration
-            TokioAsyncResolver::from_system_conf(TokioConnectionProvider::default())
-        }
-
-        // For other operating systems, we can use one of the preconfigured definitions
-        #[cfg(not(any(unix, windows)))]
-        {
-            // Directly reference the config types
-            use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-
-            // Get a new resolver with the google nameservers as the upstream recursive resolvers
-            AsyncResolver::tokio(
-                ResolverConfig::quad9(),
-                ResolverOpts::default(),
-                //runtime.handle().clone(),
-            )
-        }
-    }
-    .map(std::sync::Arc::new)
-    .expect("failed to create resolver");
+    // use the system resolver configuration
+    let resolver = Resolver::builder_tokio()
+        .expect("failed to create resolver")
+        .build()
+        .unwrap();
 
     // Create some futures representing name lookups.
     let names = ["hickory-dns.org.", "estada.ch.", "wikipedia.org."];
 
-    let first_resolve = resolve_list(&names, &*resolver).await;
-    let cached_resolve = resolve_list(&names, &*resolver).await;
+    let first_resolve = resolve_list(&names, &resolver).await;
+    let cached_resolve = resolve_list(&names, &resolver).await;
 
     resolver.clear_cache();
-    let second_resolve = resolve_list(&names, &*resolver).await;
+    let second_resolve = resolve_list(&names, &resolver).await;
 
     println!("first_resolve: {first_resolve:?}");
     println!("cached_resolve: {cached_resolve:?}");
@@ -55,9 +30,9 @@ async fn tokio_main() {
     drop(resolver);
 }
 
-async fn resolve_list<P: hickory_resolver::name_server::ConnectionProvider>(
+async fn resolve_list(
     names: &[&str],
-    resolver: &hickory_resolver::AsyncResolver<P>,
+    resolver: &Resolver<TokioRuntimeProvider>,
 ) -> tokio::time::Duration {
     use tokio::time::Instant;
     let start_time = Instant::now();
@@ -66,7 +41,7 @@ async fn resolve_list<P: hickory_resolver::name_server::ConnectionProvider>(
     let futures = names
         .iter()
         .map(|name: &&str| {
-            let name: String = name.to_string();
+            let name = name.to_string();
             let resolver = resolver.clone();
             let future = {
                 let name = name.clone();
@@ -78,18 +53,30 @@ async fn resolve_list<P: hickory_resolver::name_server::ConnectionProvider>(
 
     // Go through the list of resolution operations in parallel and wait for them to complete.
     for (name, lookup) in futures {
-        let txts = lookup.await.expect("unable to spawn resolver").map(|txt| {
-            txt.iter()
-                .map(|rdata| rdata.to_string())
-                .collect::<Vec<_>>()
-        });
+        let txts = lookup
+            .await
+            .expect("unable to spawn resolver")
+            .map(|lookup| {
+                lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|record| match &record.data {
+                        RData::TXT(txt) => Some(txt.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            });
         println!("  {name} returned to {txts:?}");
     }
     println!();
     start_time.elapsed()
 }
 
-#[test]
-fn test_flush_cache() {
-    main()
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn test_flush_cache() {
+        test_support::subscribe();
+        super::tokio_main().await;
+    }
 }

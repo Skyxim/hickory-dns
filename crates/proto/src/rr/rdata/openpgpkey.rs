@@ -6,15 +6,19 @@
 // copied, modified, or distributed except according to those terms.
 
 //! OPENPGPKEY records for OpenPGP public keys
-use std::fmt;
+use alloc::vec::Vec;
+use core::fmt;
 
-#[cfg(feature = "serde-config")]
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::ProtoResult,
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
-    serialize::binary::{BinDecoder, BinEncodable, BinEncoder, Restrict},
+    serialize::{
+        binary::{BinDecoder, BinEncodable, BinEncoder, DecodeError},
+        txt::ParseError,
+    },
 };
 
 /// [RFC 7929](https://tools.ietf.org/html/rfc7929#section-2.1)
@@ -24,10 +28,14 @@ use crate::{
 /// value consisting of a Transferable Public Key formatted as specified
 /// in [RFC4880].
 /// ```
-#[cfg_attr(feature = "serde-config", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct OPENPGPKEY {
-    public_key: Vec<u8>,
+    /// The public key.
+    ///
+    /// This should be an OpenPGP Transferable Public Key, but this is not guaranteed.
+    pub public_key: Vec<u8>,
 }
 
 impl OPENPGPKEY {
@@ -36,41 +44,52 @@ impl OPENPGPKEY {
     /// # Arguments
     ///
     /// * `public_key` - an OpenPGP Transferable Public Key. This will NOT
-    ///    be checked.
+    ///   be checked.
     pub fn new(public_key: Vec<u8>) -> Self {
         Self { public_key }
     }
 
-    /// The public key. This should be an OpenPGP Transferable Public Key,
-    /// but this is not guaranteed.
-    pub fn public_key(&self) -> &[u8] {
-        &self.public_key
+    /// Parse the RData from a set of tokens.
+    ///
+    /// [RFC 7929](https://tools.ietf.org/html/rfc7929#section-2.3)
+    ///
+    /// ```text
+    /// 2.3.  The OPENPGPKEY RDATA Presentation Format
+    ///
+    ///    The RDATA Presentation Format, as visible in Zone Files [RFC1035],
+    ///    consists of a single OpenPGP Transferable Public Key as defined in
+    ///    Section 11.1 of [RFC4880] encoded in base64 as defined in Section 4
+    ///    of [RFC4648].
+    /// ```
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        mut tokens: I,
+    ) -> Result<Self, ParseError> {
+        let encoded_public_key = tokens
+            .next()
+            .ok_or_else(|| ParseError::from("OPENPGPKEY public key field is missing"))?;
+        let public_key = data_encoding::BASE64.decode(encoded_public_key.as_bytes())?;
+        if tokens.next().is_some() {
+            return Err(ParseError::from("too many fields for OPENPGPKEY"));
+        }
+        Ok(Self::new(public_key))
     }
 }
 
 impl BinEncodable for OPENPGPKEY {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_vec(self.public_key())
+        encoder.emit_slice(&self.public_key)
     }
 }
 
 impl<'r> RecordDataDecodable<'r> for OPENPGPKEY {
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self> {
-        let rdata_length = length.map(usize::from).unverified();
+    fn read_data(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let public_key =
-            decoder.read_vec(rdata_length)?.unverified(/*we do not enforce a specific format*/);
+            decoder.read_vec_to_end().unverified(/*we do not enforce a specific format*/);
         Ok(Self::new(public_key))
     }
 }
 
 impl RecordData for OPENPGPKEY {
-    fn try_from_rdata(data: RData) -> Result<Self, RData> {
-        match data {
-            RData::OPENPGPKEY(csync) => Ok(csync),
-            _ => Err(data),
-        }
-    }
-
     fn try_borrow(data: &RData) -> Option<&Self> {
         match data {
             RData::OPENPGPKEY(csync) => Some(csync),
@@ -105,4 +124,25 @@ impl fmt::Display for OPENPGPKEY {
     }
 }
 
-// TODO test
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parsing() {
+        assert!(OPENPGPKEY::from_tokens(core::iter::empty()).is_err());
+        assert!(OPENPGPKEY::from_tokens(vec!["äöüäööüä"].into_iter()).is_err());
+        assert!(OPENPGPKEY::from_tokens(vec!["ZmFpbGVk", "äöüäöüö"].into_iter()).is_err());
+
+        assert!(
+            OPENPGPKEY::from_tokens(vec!["dHJ1c3RfZG5zIGlzIGF3ZXNvbWU="].into_iter())
+                .map(|rd| rd == OPENPGPKEY::new(b"trust_dns is awesome".to_vec()))
+                .unwrap_or(false)
+        );
+        assert!(
+            OPENPGPKEY::from_tokens(vec!["c2VsZi1wcmFpc2Ugc3Rpbmtz"].into_iter())
+                .map(|rd| rd == OPENPGPKEY::new(b"self-praise stinks".to_vec()))
+                .unwrap_or(false)
+        );
+    }
+}
